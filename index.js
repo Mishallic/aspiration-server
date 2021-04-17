@@ -12,6 +12,8 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({extended: true}))
 
 app.use(pubRoutes);
+app.use('/api', apiMiddleware, apiRoutes);
+app.use('/api/admin', apiMiddleware, adminMiddleware, adminRoutes);
 
 
 app.listen(8080, async () => {
