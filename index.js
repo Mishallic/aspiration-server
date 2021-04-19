@@ -15,7 +15,8 @@ const app = express();
 
 app.use(cors());
 app.use(bodyParser.json());
-app.use('/pub',pubRoutes);
+app.use(bodyParser.urlencoded({extended: true}));
+app.use('/pub', pubRoutes);
 app.use('/api', apiMiddleware, apiRoutes);
 app.use('/api/admin', apiMiddleware, adminMiddleware, adminRoutes);
 
