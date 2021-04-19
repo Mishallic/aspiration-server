@@ -1,7 +1,8 @@
-import { google } from 'googleapis';
-
-/*******************/
 /** CONFIGURATION **/
+const { google } = require('googleapis');
+
+require("dotenv").config();
+/*******************/
 /*******************/
 
 const googleConfig = {
@@ -47,6 +48,7 @@ function getGooglePlusApi(auth) {
  * Part 1: Create a Google URL and send to the client to log in the user.
  */
 function urlGoogle() {
+    console.log(process.env.GOOGLE_CLIENT_ID)
     const auth = createConnection();
     const url = getConnectionUrl(auth);
     return url;
@@ -55,10 +57,10 @@ function urlGoogle() {
 /**
  * Part 2: Take the "code" parameter which Google gives us once when the user logs in, then get the user's email and id.
  */
-function getGoogleAccountFromCode(code) {
+async function getGoogleAccountFromCode(code) {
+    const auth = createConnection();
     const data = await auth.getToken(code);
     const tokens = data.tokens;
-    const auth = createConnection();
     auth.setCredentials(tokens);
     const plus = getGooglePlusApi(auth);
     const me = await plus.people.get({ userId: 'me' });
@@ -70,3 +72,9 @@ function getGoogleAccountFromCode(code) {
         tokens: tokens,
     };
 }
+
+const url = urlGoogle()
+console.log(url)
+
+const acc = getGoogleAccountFromCode()
+console.log(acc)
