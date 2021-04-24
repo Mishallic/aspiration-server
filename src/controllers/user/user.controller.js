@@ -88,7 +88,7 @@ export const login = async (req, res) => {
         delete user.dataValues.password;
         return res.send({code: 200, data: {user, token}, success: true})
     } catch (error) {
-        return res.status(500).json({
+        return res.status(500).send({
             code: 500,
             errorMessage: 'Something went wrong',
             error: error.message,
@@ -121,7 +121,7 @@ export const changePassword = async (req, res) => {
         await User.update({password: newPass}, {where: {id: user.id}});
         return res.send({code: 200, data: {}, success: true})
     } catch (error) {
-        return res.status(500).json({
+        return res.status(500).send({
             code: 500,
             errorMessage: 'Something went wrong',
             error: error.message,
