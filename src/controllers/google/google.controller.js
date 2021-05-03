@@ -1,27 +1,16 @@
-/** CONFIGURATION **/
 const {google} = require('googleapis');
-
 const url = require('url');
 require("dotenv").config();
-/*******************/
-/*******************/
 
 const googleConfig = {
-    clientId: process.env.GOOGLE_CLIENT_ID, // e.g. asdfghjkljhgfdsghjk.apps.googleusercontent.com
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET, // e.g. _ASDFA%DFASDFASDFASD#FAD-
-    redirect: process.env.GOOGLE_REDIRECT_URL, // this must match your google api settings
+    clientId: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    redirect: process.env.GOOGLE_REDIRECT_URL,
 };
-
 const defaultScope = [
     'https://www.googleapis.com/auth/plus.me',
     'https://www.googleapis.com/auth/userinfo.email',
 ];
-
-/*************/
-/** HELPERS **/
-
-/*************/
-
 function createConnection() {
     return new google.auth.OAuth2(
         googleConfig.clientId,
@@ -42,24 +31,12 @@ function getGooglePlusApi(auth) {
     return google.plus({version: 'v1', auth});
 }
 
-/**********/
-/** MAIN **/
-
-/**********/
-
-/**
- * Part 1: Create a Google URL and send to the client to log in the user.
- */
 export function urlGoogle(req, res) {
-    // console.log(process.env.GOOGLE_CLIENT_ID)
     const auth = createConnection();
     const url = getConnectionUrl(auth);
     return res.send({url});
 }
 
-/**
- * Part 2: Take the "code" parameter which Google gives us once when the user logs in, then get the user's email and id.
- */
 export async function getGoogleAccountFromCode(req, res, next) {
     try {
         const code = url.parse(req.url, true).query;

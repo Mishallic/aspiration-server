@@ -31,6 +31,9 @@ module.exports = (sequelize, DataTypes) => {
             isVerified: {
                 type: DataTypes.BOOLEAN,
                 defaultValue: false
+            },
+            googleId: {
+                type: DataTypes.STRING
             }
         },
         {

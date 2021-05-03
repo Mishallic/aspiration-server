@@ -16,8 +16,7 @@ export const allUsers = async (req, res) => {
     } catch (error) {
         return res.status(500).json({
             code: 500,
-            errorMessage: 'Something went wrong',
-            error: error.message,
+            message: error.message,
             data: null,
             success: false
         })
@@ -47,12 +46,11 @@ export const register = async (req, res) => {
         };
 
         const newUser = await User.create(payload);
-        return res.send({code: 200, data: {}, success: true})
+        return res.send({code: 200, data: {}, success: true, message: 'User created successfully!'})
     } catch (err) {
         return res.status(500).json({
             code: 500,
-            errorMessage: 'Something went wrong',
-            error: err.message,
+            message: err.message,
             data: null,
             success: false
         })
@@ -88,10 +86,9 @@ export const login = async (req, res) => {
         delete user.dataValues.password;
         return res.send({code: 200, data: {user, token}, success: true})
     } catch (error) {
-        return res.status(500).send({
+        return res.status(500).json({
             code: 500,
-            errorMessage: 'Something went wrong',
-            error: error.message,
+            message: error.message,
             data: null,
             success: false
         })
@@ -121,12 +118,72 @@ export const changePassword = async (req, res) => {
         await User.update({password: newPass}, {where: {id: user.id}});
         return res.send({code: 200, data: {}, success: true})
     } catch (error) {
-        return res.status(500).send({
+        return res.status(500).json({
             code: 500,
-            errorMessage: 'Something went wrong',
-            error: error.message,
+            message: error.message,
             data: null,
             success: false
         })
     }
 };
+
+export const me = async (req, res) => {
+    try {
+        const {id} = req.body
+        const {googleId} = req.body
+        let whereQ = {googleId: googleId};
+        if (id)
+            whereQ = {id: id}
+        const user = await User.findOne({
+            where: whereQ
+        })
+        if (!user)
+            throw new Error('Invalid');
+
+        const token = jwt.sign(
+            {
+                user: {
+                    userId: user.id,
+                    email: user.email,
+                    createdAt: new Date(),
+                },
+            },
+            process.env.SECRET,
+        );
+        delete user.dataValues.password;
+        return res.send({code: 200, data: {user, token}, success: true})
+    } catch (err) {
+        return res.status(500).json({
+            code: 500,
+            message: err.message,
+            data: null,
+            success: false
+        })
+    }
+}
+
+export const oauthLog = async (data) => {
+    try {
+        let user = await User.findOne({
+            where: {
+                googleId: data.id,
+                email: data._json.email,
+            }
+        })
+        if (!user) {
+            let payload = {
+                firstName: data.name.givenName,
+                lastName: data.name.familyName,
+                email: data._json.email,
+                isVerified: Number(data._json.email_verified).toString(),
+                profilePhoto: data._json.picture,
+                password: uniqueId(),
+                googleId: data.id
+            }
+            user = await User.create(payload);
+        }
+        return user;
+    } catch (e) {
+        console.log('HERROR: ', e);
+    }
+}
