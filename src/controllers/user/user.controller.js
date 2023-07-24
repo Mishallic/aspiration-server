@@ -63,9 +63,13 @@ export const login = async (req, res) => {
         const user = await User.scope('withSecretColumns').findOne({
             where: {email: req.body.email},
         });
-        if (!user) {
+
+        if (!user) 
             throw new Error('Incorrect Email Id/Password');
-        }
+
+        if (user.googleId && user.isVerified)
+            return res.redirect(306, '/oauth/google')
+
         const reqPass = crypto
             .createHash('md5')
             .update(req.body.password || '')
@@ -97,7 +101,9 @@ export const login = async (req, res) => {
 
 export const changePassword = async (req, res) => {
     try {
-        const {userId} = req.user;
+        const { userId } = req.user;
+        if (!newPassword || !oldPassword || oldPassword.trim() === '' || newPassword.trim() === '')
+            throw new Error('Data Incomplete');
         const user = await User.scope('withSecretColumns').findOne({
             where: {id: userId},
         });

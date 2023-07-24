@@ -25,7 +25,6 @@ passport.use(new GoogleStrategy({
 }))
 
 router.get('/google', (req, res, next) => {
-    req.headers.host = 'localhost:8080'
     next()
 });
 router.get('/google', passport.authenticate('google', {
@@ -33,7 +32,8 @@ router.get('/google', passport.authenticate('google', {
 }));
 
 router.get('/google/callback', passport.authenticate('google'), (req, res, next) => {
-    res.redirect("msrm42app://msrm42app.io?googleId=" + req.user.id);
+    // res.redirect("msrm42app://msrm42app.io?googleId=" + req.user.id);
+    res.redirect("http://localhost:8080/pub/ping");
 });
 
 router.get('/oauth-google', googleController.urlGoogle)
