@@ -5,6 +5,8 @@ import { createOneTimeTokenService } from './services/oneTimeTokens.js';
 import { createMailer } from './services/mailer.js';
 import { createWebhooks } from './services/webhooks.js';
 import { createEmailFlows } from './services/emailFlows.js';
+import { createAccountService } from './services/accounts.js';
+import { createOAuthProviders } from './services/oauthProviders.js';
 
 // Builds everything the app needs: database (migrated), keys and services.
 // Route modules receive this context instead of importing globals.
@@ -22,7 +24,9 @@ export async function createContext(config, { logger = console, fetchImpl } = {}
     mailer: createMailer({ config, logger }),
     webhooks: createWebhooks({ config, logger, fetchImpl }),
   };
-  services.emailFlows = createEmailFlows({ config, services });
+  services.emailFlows = createEmailFlows({ config, models: db.models, services });
+  services.accounts = createAccountService({ sequelize: db.sequelize, models: db.models, services });
+  services.oauthProviders = createOAuthProviders({ config, fetchImpl: fetchImpl ?? globalThis.fetch });
 
   return {
     config,

@@ -24,9 +24,11 @@ function render({ appName, heading, intro, actionLabel, link, footer }) {
   return { text, html };
 }
 
-// Issues the single-use links and composes the emails that carry them.
-export function createEmailFlows({ config, services }) {
+// Issues the single-use links and composes the emails that carry them,
+// and consumes those links when they come back.
+export function createEmailFlows({ config, models, services }) {
   const { oneTimeTokens, mailer } = services;
+  const { User } = models;
   const appName = config.appName;
 
   async function sendVerification(user) {
@@ -77,5 +79,26 @@ export function createEmailFlows({ config, services }) {
     return token;
   }
 
-  return { sendVerification, sendPasswordReset };
+  // Consumes a verification link. A token is single-use, so a bad or reused one
+  // returns null. The email is pinned in the token, so a token stays valid for the
+  // address it was issued for even if the user later changes their email.
+  async function verifyEmail(rawToken) {
+    const record = await oneTimeTokens.consume({ purpose: PURPOSES.VERIFY_EMAIL, raw: rawToken });
+    if (!record?.userId) return null;
+    const user = await User.findByPk(record.userId);
+    if (!user) return null;
+    if (!user.emailVerifiedAt) await user.update({ emailVerifiedAt: new Date() });
+    return user;
+  }
+
+  // Consumes a reset link and returns the user. The caller sets the new password,
+  // so the token is spent exactly once whether or not the new password is valid...
+  // which is why the route validates the new password BEFORE calling this.
+  async function consumePasswordReset(rawToken) {
+    const record = await oneTimeTokens.consume({ purpose: PURPOSES.RESET_PASSWORD, raw: rawToken });
+    if (!record?.userId) return null;
+    return User.findByPk(record.userId);
+  }
+
+  return { sendVerification, sendPasswordReset, verifyEmail, consumePasswordReset };
 }
