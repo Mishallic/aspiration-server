@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+data
+coverage
+tests
+sdk/*.test.js
+*.md
+openapi.yaml
+.idea
+.vscode
+Dockerfile
+docker-compose.yml

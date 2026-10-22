@@ -1,0 +1,51 @@
+# `docker compose up` brings up Postgres and the auth server with no editing.
+# Copy example.env to .env first to change any setting; the defaults here are for
+# local use only. Set a real SECRET/SIGNING_KEY, PUBLIC_URL and DB password for production.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-local-dev-password}
+      POSTGRES_DB: auth
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U auth -d auth']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      DATABASE_URL: postgres://auth:${DB_PASSWORD:-local-dev-password}@db:5432/auth
+      # Everything below is optional; see example.env for the full list.
+      APP_NAME: ${APP_NAME:-Your app}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      ALLOWED_REDIRECT_URLS: ${ALLOWED_REDIRECT_URLS:-}
+      SIGNING_KEY: ${SIGNING_KEY:-}
+      SMTP_URL: ${SMTP_URL:-}
+      EMAIL_FROM: ${EMAIL_FROM:-Auth <no-reply@localhost>}
+      REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-false}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_NATIVE_CLIENT_IDS: ${GOOGLE_NATIVE_CLIENT_IDS:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      APPLE_CLIENT_IDS: ${APPLE_CLIENT_IDS:-}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      TRUST_PROXY: ${TRUST_PROXY:-}
+    ports:
+      - '${PORT:-8080}:8080'
+
+volumes:
+  db-data:
