@@ -12,6 +12,14 @@ import {
   MIN_PASSWORD_LENGTH,
 } from '../../helpers';
 
+const MAX_PAGE_SIZE = 100;
+const DEFAULT_PAGE_SIZE = 20;
+
+const toPositiveInt = (value, fallback) => {
+  const n = Number.parseInt(value, 10);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+};
+
 export const register = async (req, res, next) => {
   try {
     const { email, password, firstName, lastName } = req.body || {};
@@ -95,24 +103,25 @@ export const changePassword = async (req, res, next) => {
   }
 };
 
-export const allUsers = async (req, res) => {
-    try {
-        const page = req.params.page || 1;
-        const limit = 2;
-        const users = await User.findAndCountAll({
-            order: [['createdAt', 'DESC'], ['firstName', 'ASC']],
-            offset: (page - 1) * limit,
-            limit,
-        });
-        return res.send({code: 200, data: users, success: true})
-    } catch (error) {
-        return res.status(500).json({
-            code: 500,
-            message: error.message,
-            data: null,
-            success: false
-        })
-    }
+export const allUsers = async (req, res, next) => {
+  try {
+    const page = toPositiveInt(req.query.page, 1);
+    const limit = Math.min(toPositiveInt(req.query.limit, DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
+    const { count, rows } = await User.findAndCountAll({
+      order: [['createdAt', 'DESC'], ['id', 'DESC']],
+      offset: (page - 1) * limit,
+      limit,
+    });
+    return successResponse(req, res, {
+      users: rows.map(publicUser),
+      page,
+      limit,
+      total: count,
+      totalPages: Math.ceil(count / limit),
+    });
+  } catch (err) {
+    return next(err);
+  }
 };
 
 export const oauthLog = async (data) => {
