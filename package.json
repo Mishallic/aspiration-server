@@ -4,6 +4,11 @@
   "description": "Self-hosted auth server: email/password, Google, GitHub and Apple sign-in, refresh tokens and JWKS. Runs in one container.",
   "type": "module",
   "main": "src/server.js",
+  "exports": {
+    ".": "./src/server.js",
+    "./sdk": "./sdk/index.js",
+    "./package.json": "./package.json"
+  },
   "private": true,
   "engines": {
     "node": ">=22"

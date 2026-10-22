@@ -1,0 +1,1213 @@
+openapi: 3.1.0
+info:
+  title: aspiration-server API
+  version: 2.0.0
+  description: |
+    Self-hosted authentication server exposing a REST API under `/v1`.
+
+    ## Overview
+
+    `aspiration-server` issues **short-lived RS256 access tokens** (JWTs) that any
+    backend service can verify independently using the public keys published at the
+    JWKS endpoint (`/.well-known/jwks.json`) — no shared secret is required.
+    Access tokens are paired with **rotating refresh tokens**: each successful
+    refresh invalidates the presented refresh token and returns a new access/refresh
+    pair.
+
+    Users can authenticate with **email + password** or via federated identity
+    providers — **Google**, **GitHub** (web OAuth redirect flow) and
+    **Google / Apple** (native mobile SDK ID-token flow).
+
+    ## Authentication
+
+    Most protected endpoints require an access token sent as an HTTP Bearer
+    credential:
+
+    ```
+    Authorization: Bearer <accessToken>
+    ```
+
+    ## Access-token JWT claims
+
+    The access token is a JWS signed with **RS256**. Its header carries a `kid`
+    identifying the signing key; resolve that key from `/.well-known/jwks.json` to
+    verify the signature. No shared secret is involved, so any downstream service
+    can validate tokens offline.
+
+    Payload claims:
+
+    | Claim            | Description                                               |
+    |------------------|-----------------------------------------------------------|
+    | `iss`            | Issuer — equals `PUBLIC_URL` (default `http://localhost:8080`). |
+    | `aud`            | Audience — equals `JWT_AUDIENCE` (default `"app"`).       |
+    | `sub`            | Subject — the user id (UUID).                             |
+    | `email`          | The user's email address.                                 |
+    | `email_verified` | Whether the email has been verified.                      |
+    | `role`           | The user's role (`user` or `admin`).                      |
+    | `iat`            | Issued-at (seconds since epoch).                          |
+    | `exp`            | Expiry (seconds since epoch); access tokens are short-lived (default 900s). |
+    | `jti`            | Unique token identifier.                                  |
+
+    Verifiers should check the signature against the JWKS keys and validate `iss`,
+    `aud` and `exp`.
+
+    ## Base URL
+
+    The public base URL is configurable through the `PUBLIC_URL` environment
+    variable (default `http://localhost:8080`). All application endpoints are served
+    under the `/v1` prefix; discovery endpoints live at the root.
+  contact:
+    name: aspiration-server
+servers:
+  - url: http://localhost:8080
+    description: Local development server (default PUBLIC_URL).
+  - url: https://{host}
+    description: |
+      Self-hosted deployment. Set the `host` variable to the public hostname
+      where the server is deployed.
+    variables:
+      host:
+        default: auth.example.com
+tags:
+  - name: Discovery
+    description: Unauthenticated service, health and key-discovery endpoints.
+  - name: Auth
+    description: Email/password sign-up, sign-in, token refresh, logout and account verification.
+  - name: OAuth
+    description: Federated sign-in with Google, GitHub and Apple (web redirect and native SDK flows).
+  - name: Account
+    description: Operations on the currently authenticated user's own account and sessions.
+  - name: Admin
+    description: Administrative user management. Requires an access token whose `role` claim is `admin`.
+paths:
+  /health:
+    get:
+      tags: [Discovery]
+      summary: Liveness / readiness probe
+      description: Returns the service health status. Intended for load balancers and orchestration health checks.
+      security: []
+      responses:
+        '200':
+          description: The service is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+        '503':
+          description: The service is unavailable (e.g. a dependency such as the database is down).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: unavailable
+  /.well-known/jwks.json:
+    get:
+      tags: [Discovery]
+      summary: JSON Web Key Set
+      description: |
+        Returns the set of **public RS256 keys** used to sign access tokens.
+        Any backend can verify tokens issued by this server using these keys —
+        no shared secret is required. Clients should cache the key set and refresh
+        it when they encounter an unknown `kid`.
+      security: []
+      responses:
+        '200':
+          description: The current JSON Web Key Set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JWKS'
+  /.well-known/openid-configuration:
+    get:
+      tags: [Discovery]
+      summary: OpenID Provider metadata
+      description: Returns a subset of OpenID Connect discovery metadata describing the issuer and its signing configuration.
+      security: []
+      responses:
+        '200':
+          description: OpenID provider configuration metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenIdConfiguration'
+  /v1/auth/signup:
+    post:
+      tags: [Auth]
+      summary: Register a new account
+      description: |
+        Creates a new user from an email and password. When email verification is
+        **not** required, the response is a full `AuthResult` (user + a fresh token
+        pair). When verification **is** required by server configuration, no tokens
+        are returned; instead the response signals that the user must verify their
+        email before signing in.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+      responses:
+        '201':
+          description: |
+            Account created. Either an `AuthResult` (verification not required) or a
+            `user` object with `verificationRequired: true` (verification required,
+            no tokens issued).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/AuthResult'
+                  - $ref: '#/components/schemas/VerificationRequiredResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          description: The email address is already registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: email_taken
+                  message: An account with this email already exists.
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in with email and password
+      description: Authenticates an existing user and returns an `AuthResult` with a fresh access/refresh token pair.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authentication succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: The email or password is incorrect.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_credentials
+                  message: Invalid email or password.
+        '403':
+          description: The account exists but its email address has not been verified.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: email_not_verified
+                  message: Please verify your email address before signing in.
+        '429':
+          description: |
+            The account is temporarily locked after too many failed sign-in
+            attempts. A `Retry-After` header indicates how long to wait.
+          headers:
+            Retry-After:
+              description: Number of seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: account_locked
+                  message: Too many failed attempts. Try again later.
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh the access token
+      description: |
+        Exchanges a valid refresh token for a new `AuthResult`. Refresh tokens
+        **rotate**: the presented refresh token is invalidated and a brand-new
+        access token **and** refresh token are returned. Reusing a rotated refresh
+        token fails.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: A new access/refresh token pair.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResult'
+        '401':
+          description: The refresh token is missing, unknown, expired or already used.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_refresh_token
+                  message: The refresh token is invalid or has expired.
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Sign out (revoke a refresh token)
+      description: |
+        Revokes the given refresh token. Always returns `204`, even if the token is
+        unknown or already revoked, so callers cannot probe token validity.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+      responses:
+        '204':
+          description: The refresh token has been revoked (or did not exist).
+  /v1/auth/verify-email:
+    post:
+      tags: [Auth]
+      summary: Verify an email address
+      description: Confirms ownership of an email address using the single-use token delivered by email.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+      responses:
+        '200':
+          description: The email address has been verified.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWrapper'
+        '400':
+          description: The verification token is invalid or has expired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_token
+                  message: The verification token is invalid or has expired.
+  /v1/auth/verify-email/resend:
+    post:
+      tags: [Auth]
+      summary: Resend the email-verification message
+      description: |
+        Requests a new verification email. Always returns `204` and never reveals
+        whether an account exists for the supplied address.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+      responses:
+        '204':
+          description: If an unverified account exists for the address, a verification email has been sent.
+  /v1/auth/password/forgot:
+    post:
+      tags: [Auth]
+      summary: Request a password-reset email
+      description: |
+        Starts the password-reset flow. Always returns `204` and never reveals
+        whether an account exists for the supplied address.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+      responses:
+        '204':
+          description: If an account exists for the address, a password-reset email has been sent.
+  /v1/auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Reset a password with a reset token
+      description: Sets a new password using the single-use token delivered by the password-reset email.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '204':
+          description: The password has been reset. Existing sessions may be revoked.
+        '400':
+          description: |
+            The reset token is invalid/expired (`invalid_token`) or the request body
+            failed validation (`invalid_request`, includes `details[]`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalid_token:
+                  value:
+                    error:
+                      code: invalid_token
+                      message: The reset token is invalid or has expired.
+                invalid_request:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: Validation failed.
+                      details:
+                        - field: newPassword
+                          message: Password must be between 8 and 256 characters.
+  /v1/auth/oauth/providers:
+    get:
+      tags: [OAuth]
+      summary: List configured OAuth providers
+      description: Returns the identity providers configured on this server and which flows (native SDK, web redirect) each supports.
+      security: []
+      responses:
+        '200':
+          description: The list of configured providers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items:
+                      type: object
+                      required: [provider, native, web]
+                      properties:
+                        provider:
+                          type: string
+                          example: google
+                        native:
+                          type: boolean
+                          description: Whether native mobile SDK ID-token sign-in is supported.
+                        web:
+                          type: boolean
+                          description: Whether the web OAuth redirect flow is supported.
+  /v1/auth/oauth/{provider}/native:
+    post:
+      tags: [OAuth]
+      summary: Native (mobile SDK) OAuth sign-in
+      description: |
+        For mobile apps. The app signs in with the Google or Apple native SDK and
+        posts the resulting **ID token** here; the server validates it and returns
+        an `AuthResult`.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: The native identity provider.
+          schema:
+            type: string
+            enum: [google, apple]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idToken]
+              properties:
+                idToken:
+                  type: string
+                  description: The ID token obtained from the provider's native SDK.
+      responses:
+        '200':
+          description: Sign-in succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResult'
+        '400':
+          description: |
+            The supplied ID token failed validation (`invalid_provider_token`) or
+            the provider is not configured on this server (`provider_not_configured`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalid_provider_token:
+                  value:
+                    error:
+                      code: invalid_provider_token
+                      message: The provider ID token could not be verified.
+                provider_not_configured:
+                  value:
+                    error:
+                      code: provider_not_configured
+                      message: This provider is not configured on the server.
+        '404':
+          description: The provider in the path is not a recognised provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: unknown_provider
+                  message: Unknown OAuth provider.
+  /v1/auth/oauth/{provider}/start:
+    get:
+      tags: [OAuth]
+      summary: Begin the web OAuth redirect flow
+      description: |
+        Starts the browser-based OAuth flow. The web flow is:
+
+        1. The client opens this endpoint with a `redirect_uri` from the server's
+           allowlist.
+        2. The server redirects the browser to the identity provider.
+        3. The user authenticates at the provider, which redirects back to the
+           server's `/callback` endpoint.
+        4. The server redirects the browser back to `redirect_uri` with a
+           **one-time code in the URL fragment** (`#code=...`).
+        5. The client reads the code from the fragment and calls
+           `POST /v1/auth/oauth/exchange` to obtain an `AuthResult`.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: The web OAuth provider.
+          schema:
+            type: string
+            enum: [google, github]
+        - name: redirect_uri
+          in: query
+          required: true
+          description: Where to send the browser after authentication. Must be present in the server's redirect-URI allowlist.
+          schema:
+            type: string
+            format: uri
+      responses:
+        '302':
+          description: Redirect to the identity provider's authorization endpoint.
+          headers:
+            Location:
+              description: The provider authorization URL.
+              schema:
+                type: string
+                format: uri
+        '400':
+          description: |
+            The `redirect_uri` is not allowlisted (`invalid_redirect_uri`) or the
+            provider is not configured (`provider_not_configured`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalid_redirect_uri:
+                  value:
+                    error:
+                      code: invalid_redirect_uri
+                      message: The redirect_uri is not allowed.
+                provider_not_configured:
+                  value:
+                    error:
+                      code: provider_not_configured
+                      message: This provider is not configured on the server.
+  /v1/auth/oauth/{provider}/callback:
+    get:
+      tags: [OAuth]
+      summary: OAuth provider callback (internal step)
+      description: |
+        The provider redirects the browser here after the user authenticates. The
+        server validates the `state`, exchanges the provider `code`, mints a
+        one-time code, and redirects the browser back to the original
+        `redirect_uri`. This endpoint is an internal step of the web flow and is not
+        called directly by client code.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [google, github]
+        - name: code
+          in: query
+          required: true
+          description: The authorization code issued by the provider.
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          description: The opaque state value echoed back by the provider.
+          schema:
+            type: string
+      responses:
+        '302':
+          description: |
+            Redirect to the app's original `redirect_uri` with `#code=...` on
+            success, or `#error=...` on failure.
+          headers:
+            Location:
+              description: The app redirect URI carrying the one-time code or an error in its fragment.
+              schema:
+                type: string
+                format: uri
+  /v1/auth/oauth/exchange:
+    post:
+      tags: [OAuth]
+      summary: Exchange a one-time OAuth code for tokens
+      description: Exchanges the one-time code delivered in the redirect fragment (`#code=...`) for an `AuthResult`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: The one-time code read from the redirect URL fragment.
+      responses:
+        '200':
+          description: Sign-in succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResult'
+        '400':
+          description: The one-time code is invalid, expired or already used.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_code
+                  message: The code is invalid or has expired.
+  /v1/me:
+    get:
+      tags: [Account]
+      summary: Get the current user
+      description: Returns the profile of the authenticated user.
+      responses:
+        '200':
+          description: The current user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWrapper'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    patch:
+      tags: [Account]
+      summary: Update the current user's profile
+      description: Updates mutable profile fields. At least one field must be supplied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                firstName:
+                  type: [string, 'null']
+                lastName:
+                  type: [string, 'null']
+                avatarUrl:
+                  type: [string, 'null']
+                  format: uri
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWrapper'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    delete:
+      tags: [Account]
+      summary: Delete the current account
+      description: Permanently deletes the authenticated user's account and all associated data. This cannot be undone.
+      responses:
+        '204':
+          description: The account and all its data have been deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/me/change-password:
+    post:
+      tags: [Account]
+      summary: Change the current user's password
+      description: |
+        Changes the password. `currentPassword` is required when the account
+        already has a password set (`hasPassword: true`); it may be omitted when the
+        account has no password yet (e.g. an OAuth-only account setting one for the
+        first time). On success, **all other sessions are revoked** and a fresh
+        access/refresh token pair is returned for the current session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [newPassword]
+              properties:
+                currentPassword:
+                  type: string
+                  description: Required if the account already has a password.
+                newPassword:
+                  type: string
+                  minLength: 8
+                  maxLength: 256
+      responses:
+        '200':
+          description: The password was changed; a fresh token pair is returned and other sessions are revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResult'
+        '400':
+          description: A current password was required but not supplied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: current_password_required
+                  message: The current password is required to change it.
+        '401':
+          description: The supplied current password is incorrect, or the request is unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: invalid_credentials
+                  message: The current password is incorrect.
+  /v1/me/sessions:
+    get:
+      tags: [Account]
+      summary: List active sessions
+      description: Lists the authenticated user's active sessions (refresh tokens), and identifies the current session by its issued-at time.
+      responses:
+        '200':
+          description: The user's active sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions, currentIssuedAt]
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, createdAt, lastSeenIp, userAgent, expiresAt]
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        createdAt:
+                          type: string
+                          format: date-time
+                        lastSeenIp:
+                          type: [string, 'null']
+                        userAgent:
+                          type: [string, 'null']
+                        expiresAt:
+                          type: string
+                          format: date-time
+                  currentIssuedAt:
+                    type: integer
+                    description: The `iat` (seconds since epoch) of the current session's access token.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/me/logout-all:
+    post:
+      tags: [Account]
+      summary: Sign out of all sessions
+      description: Revokes every refresh token belonging to the authenticated user, signing them out everywhere.
+      responses:
+        '204':
+          description: All sessions have been revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/admin/users:
+    get:
+      tags: [Admin]
+      summary: List users
+      description: Returns a paginated list of users. Requires an admin access token.
+      parameters:
+        - name: page
+          in: query
+          required: false
+          description: 1-based page number.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          description: Page size.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive email substring filter.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A page of users.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users, page, limit, total, totalPages]
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+                  total:
+                    type: integer
+                  totalPages:
+                    type: integer
+        '403':
+          $ref: '#/components/responses/AdminRequired'
+  /v1/admin/users/{id}:
+    get:
+      tags: [Admin]
+      summary: Get a user by id
+      description: Returns a single user by id. Requires an admin access token.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '200':
+          description: The requested user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWrapper'
+        '403':
+          $ref: '#/components/responses/AdminRequired'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+    delete:
+      tags: [Admin]
+      summary: Delete a user
+      description: Permanently deletes a user. An admin cannot delete their own account through this endpoint. Requires an admin access token.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '204':
+          description: The user has been deleted.
+        '403':
+          description: |
+            The caller is not an admin (`admin_required`), or attempted to delete
+            their own account (`cannot_delete_self`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                admin_required:
+                  value:
+                    error:
+                      code: admin_required
+                      message: Administrator privileges are required.
+                cannot_delete_self:
+                  value:
+                    error:
+                      code: cannot_delete_self
+                      message: You cannot delete your own account here.
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+  /v1/admin/users/{id}/role:
+    patch:
+      tags: [Admin]
+      summary: Change a user's role
+      description: Sets a user's role. Changing a role revokes all of the target user's sessions. Requires an admin access token.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  type: string
+                  enum: [user, admin]
+      responses:
+        '200':
+          description: The updated user. The target user's sessions have been revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWrapper'
+        '403':
+          $ref: '#/components/responses/AdminRequired'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        An RS256-signed JWT access token. Send it as `Authorization: Bearer <token>`.
+        Verify tokens against the public keys at `/.well-known/jwks.json`.
+  parameters:
+    UserIdPath:
+      name: id
+      in: path
+      required: true
+      description: The target user's id.
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Unauthorized:
+      description: The request is missing a valid access token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: unauthorized
+              message: A valid access token is required.
+    ValidationError:
+      description: The request failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: invalid_request
+              message: Validation failed.
+              details:
+                - field: email
+                  message: A valid email address is required.
+                - field: password
+                  message: Password must be between 8 and 256 characters.
+    AdminRequired:
+      description: The caller does not have administrator privileges.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: admin_required
+              message: Administrator privileges are required.
+    UserNotFound:
+      description: No user exists with the given id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: user_not_found
+              message: User not found.
+  schemas:
+    Error:
+      type: object
+      description: The standard error envelope returned with every non-2xx response.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: A stable, machine-readable error code.
+            message:
+              type: string
+              description: A human-readable error message.
+            details:
+              type: array
+              description: Per-field validation details, present mainly on validation errors.
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field:
+                    type: [string, 'null']
+                    description: The offending field, or null when not field-specific.
+                  message:
+                    type: string
+    User:
+      type: object
+      description: A user account.
+      required:
+        - id
+        - email
+        - emailVerified
+        - firstName
+        - lastName
+        - avatarUrl
+        - role
+        - hasPassword
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        emailVerified:
+          type: boolean
+        firstName:
+          type: [string, 'null']
+        lastName:
+          type: [string, 'null']
+        avatarUrl:
+          type: [string, 'null']
+          format: uri
+        role:
+          type: string
+          enum: [user, admin]
+        hasPassword:
+          type: boolean
+          description: Whether the account has a password set (false for OAuth-only accounts).
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    UserWrapper:
+      type: object
+      description: A user object wrapped under the `user` key.
+      required: [user]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+    AuthResult:
+      type: object
+      description: |
+        A successful authentication result: the user plus a session (a fresh
+        access/refresh token pair).
+      required:
+        - user
+        - accessToken
+        - refreshToken
+        - tokenType
+        - expiresIn
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        accessToken:
+          type: string
+          description: A short-lived RS256 JWT access token.
+        refreshToken:
+          type: string
+          description: An opaque refresh token. Starts with the `rt_` prefix.
+          pattern: '^rt_'
+          example: rt_7b1c0f9a2e...
+        tokenType:
+          type: string
+          const: Bearer
+        expiresIn:
+          type: integer
+          description: Access-token lifetime in seconds.
+          default: 900
+    VerificationRequiredResult:
+      type: object
+      description: Returned from sign-up when email verification is required; no tokens are issued.
+      required: [user, verificationRequired]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        verificationRequired:
+          type: boolean
+          const: true
+    SignupRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+          maxLength: 256
+        firstName:
+          type: string
+        lastName:
+          type: string
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+          pattern: '^rt_'
+    LogoutRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+    VerifyEmailRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          description: The single-use email-verification token.
+    EmailRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+    PasswordResetRequest:
+      type: object
+      required: [token, newPassword]
+      properties:
+        token:
+          type: string
+          description: The single-use password-reset token.
+        newPassword:
+          type: string
+          minLength: 8
+          maxLength: 256
+    JWK:
+      type: object
+      description: A single public RSA JSON Web Key used to verify RS256 access tokens.
+      required: [kty, use, alg, kid, n, e]
+      properties:
+        kty:
+          type: string
+          const: RSA
+        use:
+          type: string
+          const: sig
+        alg:
+          type: string
+          const: RS256
+        kid:
+          type: string
+          description: Key identifier; matches the `kid` in the access-token JWS header.
+        n:
+          type: string
+          description: The RSA modulus, base64url-encoded.
+        e:
+          type: string
+          description: The RSA public exponent, base64url-encoded.
+    JWKS:
+      type: object
+      description: A JSON Web Key Set containing the public keys for verifying access tokens.
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/JWK'
+    OpenIdConfiguration:
+      type: object
+      description: A subset of OpenID Connect provider metadata.
+      required:
+        - issuer
+        - jwks_uri
+        - id_token_signing_alg_values_supported
+        - token_endpoint
+        - response_types_supported
+        - subject_types_supported
+      properties:
+        issuer:
+          type: string
+          format: uri
+          description: The issuer identifier (equals `PUBLIC_URL`).
+        jwks_uri:
+          type: string
+          format: uri
+          description: URL of the JWKS endpoint.
+        id_token_signing_alg_values_supported:
+          type: array
+          items:
+            type: string
+          example: [RS256]
+        token_endpoint:
+          type: string
+          format: uri
+        response_types_supported:
+          type: array
+          items:
+            type: string
+        subject_types_supported:
+          type: array
+          items:
+            type: string
+          example: [public]
+security:
+  - bearerAuth: []
