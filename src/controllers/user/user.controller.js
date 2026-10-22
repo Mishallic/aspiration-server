@@ -1,7 +1,99 @@
-import {User} from '../../models';
-import {successResponse, errorResponse, uniqueId} from '../../helpers';
-import crypto from "crypto";
-import jwt from "jsonwebtoken"
+import { User } from '../../models';
+import {
+  successResponse,
+  errorResponse,
+  uniqueId,
+  hashPassword,
+  comparePassword,
+  signToken,
+  publicUser,
+  isEmail,
+  isNonEmptyString,
+  MIN_PASSWORD_LENGTH,
+} from '../../helpers';
+
+export const register = async (req, res, next) => {
+  try {
+    const { email, password, firstName, lastName } = req.body || {};
+    if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
+      return errorResponse(req, res, 'Email and password are required', 400);
+    }
+    if (!isEmail(email)) return errorResponse(req, res, 'Email is not valid', 400);
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      return errorResponse(req, res, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`, 400);
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const existing = await User.findOne({ where: { email: normalizedEmail } });
+    if (existing) return errorResponse(req, res, 'User already exists with same email', 409);
+
+    const user = await User.create({
+      email: normalizedEmail,
+      firstName,
+      lastName,
+      password: await hashPassword(password),
+      isVerified: false,
+      verifyToken: uniqueId(),
+    });
+    return successResponse(req, res, { user: publicUser(user) }, 201);
+  } catch (err) {
+    return next(err);
+  }
+};
+
+export const login = async (req, res, next) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
+      return errorResponse(req, res, 'Email and password are required', 400);
+    }
+
+    const user = await User.scope('withSecretColumns').findOne({
+      where: { email: email.trim().toLowerCase() },
+    });
+    // Same message for an unknown email and a wrong password, so the
+    // endpoint cannot be used to discover which emails are registered.
+    if (!user || !(await comparePassword(password, user.password))) {
+      return errorResponse(req, res, 'Incorrect email or password', 401);
+    }
+
+    return successResponse(req, res, { user: publicUser(user), token: signToken(user) });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+export const me = async (req, res, next) => {
+  try {
+    const user = await User.findByPk(req.user.userId);
+    if (!user) return errorResponse(req, res, 'User is not found in system', 404);
+    return successResponse(req, res, { user: publicUser(user) });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+export const changePassword = async (req, res, next) => {
+  try {
+    const { oldPassword, newPassword } = req.body || {};
+    if (!isNonEmptyString(oldPassword) || !isNonEmptyString(newPassword)) {
+      return errorResponse(req, res, 'oldPassword and newPassword are required', 400);
+    }
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      return errorResponse(req, res, `New password must be at least ${MIN_PASSWORD_LENGTH} characters`, 400);
+    }
+
+    const user = await User.scope('withSecretColumns').findByPk(req.user.userId);
+    if (!user || !(await comparePassword(oldPassword, user.password))) {
+      return errorResponse(req, res, 'Old password is incorrect', 401);
+    }
+
+    await user.update({ password: await hashPassword(newPassword) });
+    return successResponse(req, res, {});
+  } catch (err) {
+    return next(err);
+  }
+};
 
 export const allUsers = async (req, res) => {
     try {
@@ -22,151 +114,6 @@ export const allUsers = async (req, res) => {
         })
     }
 };
-
-export const register = async (req, res) => {
-    try {
-        const {email, password} = req.body;
-        if (!email || !password || email.trim() === '' || password.trim() === '')
-            throw new Error('Invalid email or password')
-        const user = await User.scope('withSecretColumns').findOne({
-            where: {email},
-        });
-        if (user) {
-            throw new Error('User already exists with same email');
-        }
-        const reqPass = crypto
-            .createHash('md5')
-            .update(password)
-            .digest('hex');
-        const payload = {
-            email,
-            password: reqPass,
-            isVerified: false,
-            verifyToken: uniqueId(),
-        };
-
-        const newUser = await User.create(payload);
-        return res.send({code: 200, data: {}, success: true, message: 'User created successfully!'})
-    } catch (err) {
-        return res.status(500).json({
-            code: 500,
-            message: err.message,
-            data: null,
-            success: false
-        })
-    }
-}
-
-
-export const login = async (req, res) => {
-    try {
-        const user = await User.scope('withSecretColumns').findOne({
-            where: {email: req.body.email},
-        });
-
-        if (!user) 
-            throw new Error('Incorrect Email Id/Password');
-
-        if (user.googleId && user.isVerified)
-            return res.redirect(306, '/oauth/google')
-
-        const reqPass = crypto
-            .createHash('md5')
-            .update(req.body.password || '')
-            .digest('hex');
-        if (reqPass !== user.password) {
-            throw new Error('Incorrect Email Id/Password');
-        }
-        const token = jwt.sign(
-            {
-                user: {
-                    userId: user.id,
-                    email: user.email,
-                    createdAt: new Date(),
-                },
-            },
-            process.env.SECRET,
-        );
-        delete user.dataValues.password;
-        return res.send({code: 200, data: {user, token}, success: true})
-    } catch (error) {
-        return res.status(500).json({
-            code: 500,
-            message: error.message,
-            data: null,
-            success: false
-        })
-    }
-};
-
-export const changePassword = async (req, res) => {
-    try {
-        const { userId } = req.user;
-        if (!newPassword || !oldPassword || oldPassword.trim() === '' || newPassword.trim() === '')
-            throw new Error('Data Incomplete');
-        const user = await User.scope('withSecretColumns').findOne({
-            where: {id: userId},
-        });
-
-        const reqPass = crypto
-            .createHash('md5')
-            .update(req.body.oldPassword)
-            .digest('hex');
-        if (reqPass !== user.password) {
-            throw new Error('Old password is incorrect');
-        }
-
-        const newPass = crypto
-            .createHash('md5')
-            .update(req.body.newPassword)
-            .digest('hex');
-
-        await User.update({password: newPass}, {where: {id: user.id}});
-        return res.send({code: 200, data: {}, success: true})
-    } catch (error) {
-        return res.status(500).json({
-            code: 500,
-            message: error.message,
-            data: null,
-            success: false
-        })
-    }
-};
-
-export const me = async (req, res) => {
-    try {
-        const {id} = req.body
-        const {googleId} = req.body
-        let whereQ = {googleId: googleId};
-        if (id)
-            whereQ = {id: id}
-        const user = await User.findOne({
-            where: whereQ
-        })
-        if (!user)
-            throw new Error('Invalid');
-
-        const token = jwt.sign(
-            {
-                user: {
-                    userId: user.id,
-                    email: user.email,
-                    createdAt: new Date(),
-                },
-            },
-            process.env.SECRET,
-        );
-        delete user.dataValues.password;
-        return res.send({code: 200, data: {user, token}, success: true})
-    } catch (err) {
-        return res.status(500).json({
-            code: 500,
-            message: err.message,
-            data: null,
-            success: false
-        })
-    }
-}
 
 export const oauthLog = async (data) => {
     try {

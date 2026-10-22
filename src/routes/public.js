@@ -3,11 +3,8 @@ import * as userController from '../controllers/user/user.controller';
 
 const router = express.Router();
 
+router.get('/PING', (req, res) => res.send('PONG'));
+router.post('/user/register', userController.register);
+router.post('/user/login', userController.login);
 
-router.get('/PING', (req, res) => {
-    res.send('PONG')
-})
-router.post('/user/register', userController.register)
-router.post('/user/login', userController.login)
-router.post('/user/me', userController.me)
-module.exports = router
+module.exports = router;

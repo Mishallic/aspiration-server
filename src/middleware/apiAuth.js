@@ -1,35 +1,30 @@
-const jwt = require('jsonwebtoken');
-import {errorResponse} from '../helpers';
-import {User} from '../models';
+import { errorResponse, verifyToken } from '../helpers';
+import { User } from '../models';
 
 const apiAuth = async (req, res, next) => {
+  const token = req.headers['x-token'];
+  if (!token) return errorResponse(req, res, 'Token is not provided', 401);
 
-    if (!(req.headers && req.headers['x-token']))
-        return errorResponse(req, res, 'Token is not provided', 401);
-    const token = req.headers['x-token'];
+  let decoded;
+  try {
+    decoded = verifyToken(token);
+  } catch (err) {
+    return errorResponse(req, res, 'Invalid or expired token, please log in again', 401);
+  }
 
-    try {
-        const decoded = jwt.verify(token, process.env.SECRET);
-        req.user = decoded.user;
-        const user = await User.scope('withSecretColumns').findOne({
-            where: {email: req.user.email},
-        });
+  try {
+    const user = await User.scope('withSecretColumns').findByPk(decoded.user.userId);
+    if (!user) return errorResponse(req, res, 'User is not found in system', 401);
 
-        if (!user)
-            return errorResponse(req, res, 'User is not found in system', 401);
-
-        const reqUser = {...user.get()};
-        reqUser.userId = user.id;
-        req.user = reqUser;
-        return next();
-    } catch (error) {
-        return errorResponse(
-            req,
-            res,
-            'Incorrect token is provided, try re-login',
-            401,
-        );
-    }
+    const reqUser = user.get({ plain: true });
+    delete reqUser.password;
+    delete reqUser.verifyToken;
+    reqUser.userId = user.id;
+    req.user = reqUser;
+    return next();
+  } catch (err) {
+    return next(err);
+  }
 };
 
 export default apiAuth;
