@@ -2,7 +2,6 @@ import passport from "passport";
 import express from "express";
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 
-import * as googleController from "../controllers/google/google.controller";
 import * as userController from "../controllers/user/user.controller";
 
 const router = express.Router();
@@ -36,9 +35,7 @@ router.get('/google/callback', passport.authenticate('google'), (req, res, next)
     res.redirect("http://localhost:8080/pub/ping");
 });
 
-router.get('/oauth-google', googleController.urlGoogle)
 
-router.get('/google-auth-code', googleController.getGoogleAccountFromCode)
 
 
 module.exports = router
