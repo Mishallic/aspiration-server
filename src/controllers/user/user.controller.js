@@ -124,28 +124,30 @@ export const allUsers = async (req, res, next) => {
   }
 };
 
-export const oauthLog = async (data) => {
-    try {
-        let user = await User.findOne({
-            where: {
-                googleId: data.id,
-                email: data._json.email,
-            }
-        })
-        if (!user) {
-            let payload = {
-                firstName: data.name.givenName,
-                lastName: data.name.familyName,
-                email: data._json.email,
-                isVerified: Number(data._json.email_verified).toString(),
-                profilePhoto: data._json.picture,
-                password: uniqueId(),
-                googleId: data.id
-            }
-            user = await User.create(payload);
-        }
-        return user;
-    } catch (e) {
-        console.log('HERROR: ', e);
-    }
-}
+// Find or create the local user for a Google profile. An existing
+// email/password account with the same email gets linked to it.
+export const findOrCreateGoogleUser = async (profile) => {
+  const email = profile.emails && profile.emails[0] && profile.emails[0].value;
+  if (!email) throw new Error('Google account has no email address');
+  const normalizedEmail = email.toLowerCase();
+
+  let user = await User.findOne({ where: { googleId: profile.id } });
+  if (!user) user = await User.findOne({ where: { email: normalizedEmail } });
+
+  if (!user) {
+    return User.create({
+      email: normalizedEmail,
+      firstName: profile.name && profile.name.givenName,
+      lastName: profile.name && profile.name.familyName,
+      profilePhoto: profile.photos && profile.photos[0] && profile.photos[0].value,
+      googleId: profile.id,
+      isVerified: true,
+      // Google users sign in through Google. This random hash only keeps the
+      // column non-null and cannot be guessed.
+      password: await hashPassword(uniqueId(32)),
+    });
+  }
+
+  if (!user.googleId) await user.update({ googleId: profile.id, isVerified: true });
+  return user;
+};
