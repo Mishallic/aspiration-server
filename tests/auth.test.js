@@ -1,185 +1,260 @@
-import request from 'supertest';
-import jwt from 'jsonwebtoken';
-import app from '../src/app';
-import { sequelize, User } from '../src/models';
-import config from '../src/config';
+import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { MAX_FAILED_LOGINS } from '../src/routes/auth.js';
+import { PASSWORD, createTestApp, lastEmail, signUp, verifyLikeAThirdParty } from './helpers.js';
 
-const EMAIL = 'ada@example.com';
-const PASSWORD = 'analytical-engine';
+describe('sign-up', () => {
+  let t;
+  beforeAll(async () => {
+    t = await createTestApp();
+  });
+  afterAll(() => t.close());
 
-const register = (body) => request(app).post('/pub/user/register').send(body);
-const login = (body) => request(app).post('/pub/user/login').send(body);
-
-beforeAll(async () => {
-  await sequelize.sync({ force: true });
-});
-
-afterAll(async () => {
-  await sequelize.close();
-});
-
-describe('POST /pub/user/register', () => {
-  test('creates a user and never returns secrets', async () => {
-    const res = await register({ email: EMAIL, password: PASSWORD, firstName: 'Ada' });
+  test('creates the user, returns a session and sends a verification email', async () => {
+    const res = await t.api().post('/v1/auth/signup').send({
+      email: '  Ada@Example.COM ',
+      password: PASSWORD,
+      firstName: 'Ada',
+    });
     expect(res.status).toBe(201);
-    expect(res.body.success).toBe(true);
-    expect(res.body.data.user).toMatchObject({ email: EMAIL, firstName: 'Ada', isVerified: false });
-    expect(res.body.data.user.password).toBeUndefined();
-    expect(res.body.data.user.verifyToken).toBeUndefined();
+    expect(res.body.user).toMatchObject({
+      email: 'ada@example.com',
+      firstName: 'Ada',
+      emailVerified: false,
+      role: 'user',
+      hasPassword: true,
+    });
+    expect(res.body).toMatchObject({ tokenType: 'Bearer', expiresIn: 900 });
+    expect(res.body.refreshToken).toMatch(/^rt_/);
+    expect(lastEmail(t.ctx)).toMatchObject({ to: 'ada@example.com', subject: expect.stringMatching(/Confirm/) });
   });
 
-  test('stores a bcrypt hash, not the password or an MD5', async () => {
-    const user = await User.scope('withSecretColumns').findOne({ where: { email: EMAIL } });
-    expect(user.password).toMatch(/^\$2[aby]\$/);
-    expect(user.password).not.toMatch(/^[a-f0-9]{32}$/);
+  test('the access token verifies with only the public JWKS', async () => {
+    const { user, accessToken } = await signUp(t.app, { email: 'jwks@example.com' });
+    const { payload, protectedHeader } = await verifyLikeAThirdParty(t.app, accessToken, t.config);
+    expect(protectedHeader.alg).toBe('RS256');
+    expect(payload).toMatchObject({ sub: user.id, email: 'jwks@example.com', email_verified: false, role: 'user' });
+    expect(payload.exp - payload.iat).toBe(900);
   });
 
-  test('rejects a duplicate email regardless of case', async () => {
-    const res = await register({ email: 'ADA@Example.com', password: PASSWORD });
+  test('stores an Argon2id hash, never the password', async () => {
+    const user = await t.ctx.models.User.findOne({ where: { email: 'ada@example.com' } });
+    expect(user.passwordHash).toMatch(/^\$argon2id\$/);
+    expect(user.passwordHash).not.toContain(PASSWORD);
+  });
+
+  test('responses never include secrets', async () => {
+    const { user } = await signUp(t.app, { email: 'secrets@example.com' });
+    for (const field of ['passwordHash', 'failedLoginCount', 'lockedUntil', 'tokensValidAfter']) {
+      expect(user[field]).toBeUndefined();
+    }
+  });
+
+  test('rejects a duplicate email in any letter case', async () => {
+    const res = await t.api().post('/v1/auth/signup').send({ email: 'ADA@example.com', password: PASSWORD });
     expect(res.status).toBe(409);
-    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('email_taken');
   });
 
   test.each([
-    [{}, 'missing both'],
-    [{ email: 'x@y.co' }, 'missing password'],
-    [{ password: PASSWORD }, 'missing email'],
-    [{ email: '   ', password: PASSWORD }, 'blank email'],
-    [{ email: 'not-an-email', password: PASSWORD }, 'invalid email'],
-    [{ email: 'x@y.co', password: 'short' }, 'short password'],
-  ])('returns 400 for %p (%s)', async (body) => {
-    const res = await register(body);
+    [{}, 'email'],
+    [{ email: 'not-an-email', password: PASSWORD }, 'email'],
+    [{ email: 'short@example.com', password: 'short' }, 'password'],
+    [{ email: 'long@example.com', password: 'x'.repeat(257) }, 'password'],
+    [{ email: 'type@example.com', password: 12345678 }, 'password'],
+  ])('returns 400 with field details for %o', async (body, field) => {
+    const res = await t.api().post('/v1/auth/signup').send(body);
     expect(res.status).toBe(400);
-    expect(res.body.errorMessage).toEqual(expect.any(String));
+    expect(res.body.error.code).toBe('invalid_request');
+    expect(res.body.error.details.map((d) => d.field)).toContain(field);
   });
 
-  test('ignores attempts to self-assign admin or verified status', async () => {
-    const res = await register({ email: 'mallory@example.com', password: PASSWORD, isAdmin: true, isVerified: true });
+  test('cannot self-assign a role or verified email', async () => {
+    const res = await t.api().post('/v1/auth/signup').send({
+      email: 'mallory@example.com',
+      password: PASSWORD,
+      role: 'admin',
+      emailVerifiedAt: new Date().toISOString(),
+    });
     expect(res.status).toBe(201);
-    const user = await User.scope('withSecretColumns').findOne({ where: { email: 'mallory@example.com' } });
-    expect(user.isAdmin).toBe(false);
-    expect(user.isVerified).toBe(false);
+    expect(res.body.user).toMatchObject({ role: 'user', emailVerified: false });
   });
 });
 
-describe('POST /pub/user/login', () => {
-  test('returns a token and the user for correct credentials', async () => {
-    const res = await login({ email: EMAIL, password: PASSWORD });
+describe('login and lockout', () => {
+  let t;
+  beforeAll(async () => {
+    t = await createTestApp();
+    await signUp(t.app, { email: 'grace@example.com' });
+  });
+  afterAll(() => t.close());
+
+  const login = (body) => t.api().post('/v1/auth/login').send(body);
+
+  test('returns the user and a session for correct credentials', async () => {
+    const res = await login({ email: 'Grace@Example.com', password: PASSWORD });
     expect(res.status).toBe(200);
-    expect(res.body.data.user.email).toBe(EMAIL);
-    expect(res.body.data.user.password).toBeUndefined();
-    const decoded = jwt.verify(res.body.data.token, config.jwtSecret);
-    expect(decoded.user.email).toBe(EMAIL);
+    expect(res.body.user.email).toBe('grace@example.com');
+    expect(res.body.accessToken).toEqual(expect.any(String));
   });
 
-  test('accepts the email in any case', async () => {
-    const res = await login({ email: 'Ada@EXAMPLE.com', password: PASSWORD });
-    expect(res.status).toBe(200);
-  });
-
-  test('wrong password and unknown email give the same 401', async () => {
-    const wrong = await login({ email: EMAIL, password: 'not-the-password' });
+  test('wrong password and unknown email give the same answer', async () => {
+    const wrong = await login({ email: 'grace@example.com', password: 'not the password' });
     const unknown = await login({ email: 'nobody@example.com', password: PASSWORD });
     expect(wrong.status).toBe(401);
     expect(unknown.status).toBe(401);
-    expect(wrong.body.errorMessage).toEqual(unknown.body.errorMessage);
+    expect(wrong.body).toEqual(unknown.body);
   });
 
-  test('returns 400 when fields are missing', async () => {
-    const res = await login({ email: EMAIL });
-    expect(res.status).toBe(400);
+  test('repeated wrong passwords lock the account, but always answer with a generic 401', async () => {
+    await signUp(t.app, { email: 'target@example.com' });
+    for (let i = 0; i < MAX_FAILED_LOGINS; i += 1) {
+      await login({ email: 'target@example.com', password: 'guess' });
+    }
+    const user = await t.ctx.models.User.findOne({ where: { email: 'target@example.com' } });
+    expect(user.lockedUntil).toBeInstanceOf(Date);
+
+    // A wrong password while locked still gets the same generic answer: the lock state
+    // is never surfaced to an unauthenticated caller (no enumeration, no 429 oracle).
+    const stillWrong = await login({ email: 'target@example.com', password: 'guess' });
+    expect(stillWrong.status).toBe(401);
+    expect(stillWrong.body.error.code).toBe('invalid_credentials');
+  });
+
+  test('the correct password always signs in and clears the lock (no targeted lockout DoS)', async () => {
+    const user = await t.ctx.models.User.findOne({ where: { email: 'target@example.com' } });
+    await user.update({ lockedUntil: new Date(Date.now() + 10 * 60_000), failedLoginCount: 0 });
+    const res = await login({ email: 'target@example.com', password: PASSWORD });
+    expect(res.status).toBe(200);
+    await user.reload();
+    expect(user.lockedUntil).toBeNull();
+    expect(user.failedLoginCount).toBe(0);
+  });
+
+  test('a user without a password (social sign-in only) cannot log in with one', async () => {
+    await t.ctx.models.User.create({ email: 'social@example.com', passwordHash: null });
+    const res = await login({ email: 'social@example.com', password: PASSWORD });
+    expect(res.status).toBe(401);
   });
 });
 
-describe('authenticated routes', () => {
-  let token;
-
+describe('refresh and logout', () => {
+  let t;
   beforeAll(async () => {
-    const res = await login({ email: EMAIL, password: PASSWORD });
-    token = res.body.data.token;
+    t = await createTestApp();
+  });
+  afterAll(() => t.close());
+
+  const refresh = (refreshToken) => t.api().post('/v1/auth/refresh').send({ refreshToken });
+
+  test('rotates the refresh token on every use', async () => {
+    const first = await signUp(t.app, { email: 'rotate@example.com' });
+    const res = await refresh(first.refreshToken);
+    expect(res.status).toBe(200);
+    expect(res.body.refreshToken).not.toBe(first.refreshToken);
+    expect(res.body.user.email).toBe('rotate@example.com');
+    const again = await refresh(res.body.refreshToken);
+    expect(again.status).toBe(200);
   });
 
-  describe('GET /api/me', () => {
-    test('returns the signed-in user', async () => {
-      const res = await request(app).get('/api/me').set('x-token', token);
-      expect(res.status).toBe(200);
-      expect(res.body.data.user.email).toBe(EMAIL);
-      expect(res.body.data.user.password).toBeUndefined();
-    });
+  test('reusing a rotated token revokes the whole chain', async () => {
+    const first = await signUp(t.app, { email: 'stolen@example.com' });
+    const second = (await refresh(first.refreshToken)).body;
 
-    test('returns 401 without a token', async () => {
-      const res = await request(app).get('/api/me');
-      expect(res.status).toBe(401);
-    });
+    const replay = await refresh(first.refreshToken);
+    expect(replay.status).toBe(401);
+    expect(replay.body.error.code).toBe('invalid_refresh_token');
 
-    test('returns 401 for a forged token', async () => {
-      const forged = jwt.sign({ user: { userId: 1, email: EMAIL } }, 'attacker-secret');
-      const res = await request(app).get('/api/me').set('x-token', forged);
-      expect(res.status).toBe(401);
-    });
-
-    test('returns 401 for an expired token', async () => {
-      const expired = jwt.sign({ user: { userId: 1, email: EMAIL } }, config.jwtSecret, { expiresIn: -10 });
-      const res = await request(app).get('/api/me').set('x-token', expired);
-      expect(res.status).toBe(401);
-    });
-
-    test('the old unauthenticated token-minting endpoint is gone', async () => {
-      const res = await request(app).post('/pub/user/me').send({ id: 1 });
-      expect(res.status).toBe(404);
-      expect(res.body.data).toBeNull();
-    });
+    // The legitimate holder's newer token is gone too, so the thief gains nothing.
+    expect((await refresh(second.refreshToken)).status).toBe(401);
   });
 
-  describe('POST /api/changePassword', () => {
-    const NEW_PASSWORD = 'difference-engine';
-
-    test('returns 401 without a token', async () => {
-      const res = await request(app)
-        .post('/api/changePassword')
-        .send({ oldPassword: PASSWORD, newPassword: NEW_PASSWORD });
-      expect(res.status).toBe(401);
-    });
-
-    test('returns 400 when fields are missing', async () => {
-      const res = await request(app).post('/api/changePassword').set('x-token', token).send({});
-      expect(res.status).toBe(400);
-    });
-
-    test('returns 400 for a short new password', async () => {
-      const res = await request(app)
-        .post('/api/changePassword')
-        .set('x-token', token)
-        .send({ oldPassword: PASSWORD, newPassword: 'short' });
-      expect(res.status).toBe(400);
-    });
-
-    test('returns 401 when the old password is wrong', async () => {
-      const res = await request(app)
-        .post('/api/changePassword')
-        .set('x-token', token)
-        .send({ oldPassword: 'not-the-password', newPassword: NEW_PASSWORD });
-      expect(res.status).toBe(401);
-    });
-
-    test('changes the password so only the new one logs in', async () => {
-      const res = await request(app)
-        .post('/api/changePassword')
-        .set('x-token', token)
-        .send({ oldPassword: PASSWORD, newPassword: NEW_PASSWORD });
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-
-      expect((await login({ email: EMAIL, password: PASSWORD })).status).toBe(401);
-      expect((await login({ email: EMAIL, password: NEW_PASSWORD })).status).toBe(200);
-    });
+  test('two concurrent refreshes with one token cannot both succeed', async () => {
+    const { refreshToken } = await signUp(t.app, { email: 'race@example.com' });
+    const results = await Promise.all([refresh(refreshToken), refresh(refreshToken)]);
+    expect(results.filter((r) => r.status === 200).length).toBeLessThanOrEqual(1);
   });
 
-  test('a token for a deleted user is rejected', async () => {
-    await register({ email: 'temp@example.com', password: PASSWORD });
-    const { body } = await login({ email: 'temp@example.com', password: PASSWORD });
-    await User.destroy({ where: { email: 'temp@example.com' } });
-    const res = await request(app).get('/api/me').set('x-token', body.data.token);
+  test('stores only a hash of the refresh token', async () => {
+    const { refreshToken, user } = await signUp(t.app, { email: 'hash@example.com' });
+    const rows = await t.ctx.models.RefreshToken.findAll({ where: { userId: user.id } });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].tokenHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(rows[0].tokenHash).not.toContain(refreshToken.slice(3));
+  });
+
+  test('expired refresh tokens are rejected', async () => {
+    const { refreshToken, user } = await signUp(t.app, { email: 'old@example.com' });
+    await t.ctx.models.RefreshToken.update({ expiresAt: new Date(Date.now() - 1000) }, { where: { userId: user.id } });
+    expect((await refresh(refreshToken)).status).toBe(401);
+  });
+
+  test.each(['', 'garbage', 'rt_doesnotexist'])('rejects a bad refresh token %p', async (token) => {
+    const res = await refresh(token);
+    expect([400, 401]).toContain(res.status);
+  });
+
+  test('logout ends the session and is always 204', async () => {
+    const { refreshToken } = await signUp(t.app, { email: 'bye@example.com' });
+    const res = await t.api().post('/v1/auth/logout').send({ refreshToken });
+    expect(res.status).toBe(204);
+    expect((await refresh(refreshToken)).status).toBe(401);
+    expect((await t.api().post('/v1/auth/logout').send({ refreshToken: 'rt_unknown' })).status).toBe(204);
+  });
+
+  test('logout leaves the user signed in on other devices', async () => {
+    const phone = await signUp(t.app, { email: 'devices@example.com' });
+    const laptop = (await t.api().post('/v1/auth/login').send({ email: 'devices@example.com', password: PASSWORD }))
+      .body;
+    await t.api().post('/v1/auth/logout').send({ refreshToken: phone.refreshToken });
+    expect((await refresh(laptop.refreshToken)).status).toBe(200);
+  });
+});
+
+describe('when email verification is required', () => {
+  let t;
+  beforeAll(async () => {
+    t = await createTestApp({ REQUIRE_EMAIL_VERIFICATION: 'true' });
+  });
+  afterAll(() => t.close());
+
+  test('sign-up returns no session until the email is confirmed', async () => {
+    const res = await t.api().post('/v1/auth/signup').send({ email: 'verify@example.com', password: PASSWORD });
+    expect(res.status).toBe(201);
+    expect(res.body.verificationRequired).toBe(true);
+    expect(res.body.accessToken).toBeUndefined();
+  });
+
+  test('login is refused with a clear code until then', async () => {
+    const res = await t.api().post('/v1/auth/login').send({ email: 'verify@example.com', password: PASSWORD });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('email_not_verified');
+  });
+
+  test('a wrong password still gets the generic error, so the flag leaks nothing', async () => {
+    const res = await t.api().post('/v1/auth/login').send({ email: 'verify@example.com', password: 'wrong pass' });
     expect(res.status).toBe(401);
+  });
+});
+
+describe('webhooks', () => {
+  test('sign-up emits a signed user.created event', async () => {
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      calls.push({ url, init });
+      return { ok: true, status: 200 };
+    };
+    const t = await createTestApp(
+      { WEBHOOK_URL: 'https://hooks.example.com/auth', WEBHOOK_SECRET: 'a-very-long-webhook-secret-123' },
+      { fetchImpl },
+    );
+    await signUp(t.app, { email: 'hook@example.com' });
+    await t.ctx.services.webhooks.flush();
+    await t.close();
+
+    expect(calls).toHaveLength(1);
+    const body = JSON.parse(calls[0].init.body);
+    expect(body).toMatchObject({ type: 'user.created', data: { user: { email: 'hook@example.com' } } });
+    expect(body.data.user.passwordHash).toBeUndefined();
+    expect(calls[0].init.headers['webhook-signature']).toMatch(/^t=\d+,v1=[a-f0-9]{64}$/);
   });
 });

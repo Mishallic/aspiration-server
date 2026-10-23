@@ -1,165 +1,340 @@
 # aspiration-server
 
-An authentication API for a mobile or web client. Users sign up with email and password or with Google, get a JSON Web Token (JWT), and use it to reach protected routes. Admins can page through all users.
+A self-hosted authentication server you run next to your app, in one container, owning your own user data.
 
-Built with Express 5 and Sequelize. It runs on SQLite with zero setup, and on MySQL or Postgres in production.
+aspiration-server is an alternative to Auth0, Clerk and Firebase Auth for teams who want to self-host. It handles sign-up, sign-in, social login, email verification, password reset and sessions, and it signs short-lived JWTs that any backend verifies through standard JWKS. There is no vendor to call at runtime, no shared secret to distribute, and no per-user pricing. You run it, you own the database, and you can be **set up and running in under 10 minutes**.
 
-## What it does
+It is built for developers who want a single, auditable auth service: one Node process, a Postgres database in production (or zero-setup SQLite for local dev), and a public key your other services trust.
 
-- **Email and password accounts.** Register, log in, change password. Passwords are hashed with bcrypt.
-- **Google sign-in.** The OAuth flow creates the account on first sign-in, or links Google to an existing account with the same email.
-- **JWT sessions.** Login and Google sign-in both return a signed token that expires after 7 days by default. Clients send it in the `x-token` header.
-- **Admin listing.** Admins can page through users. Password hashes and verify tokens never leave the server.
-- **Consistent errors.** Every response has the same JSON shape and a real HTTP status code.
+## Features
 
-## How it works
+- **Email and password** sign-in, with passwords hashed using **Argon2id** (OWASP parameters).
+- **Email verification** and **password reset** flows (SMTP), with links that expire and are single-use.
+- **Social sign-in** with Google, GitHub and Apple. Google and Apple work natively on mobile via an ID token; Google and GitHub work on the web via a redirect flow.
+- **Short-lived RS256 access tokens** (JWTs) published through **JWKS**, so any backend in any language verifies them locally with no shared secret and no call back to the auth server.
+- **Rotating refresh tokens** with reuse detection: a stolen-and-reused token revokes the whole token family.
+- **Account lockout** after repeated failed sign-ins, plus per-IP and per-email **rate limiting**.
+- **Sessions list** and **sign-out everywhere**, so users can see and end their logins on other devices.
+- **Self-service account deletion**, as required by the App Store and GDPR.
+- **Admin user management**: list, inspect, change roles and delete users.
+- **Signed webhooks** on `user.created` and `user.deleted`.
+- A **JavaScript SDK** for browser and Node apps.
 
-```
-client ── POST /pub/user/login ──▶ bcrypt check ──▶ JWT { userId, email }
-client ── GET /api/me + x-token ─▶ apiAuth: verify JWT, load user ──▶ handler
-client ── GET /oauth/google ─────▶ Google consent ──▶ /oauth/google/callback
-                                   find or create user ──▶ JWT (JSON or redirect)
-```
+## Quick start (under 10 minutes)
 
-`apiAuth` verifies the token, then reloads the user from the database on every request. A deleted user's token stops working immediately, and an admin flag change takes effect on the next request.
-
-On start, the server calls `sequelize.sync()`, which creates the `user` table if it is missing.
-
-## Architecture
-
-```
-index.js                      bootstrap: connect DB, sync, listen
-src/
-  app.js                      Express app (no listen, so tests import it)
-  config.js                   every environment variable, with defaults
-  models/index.js             Sequelize setup: SQLite, MySQL or Postgres
-  models/user.js              User model; secrets hidden by default scope
-  helpers/index.js            responses, bcrypt, JWT, validation
-  middleware/apiAuth.js       JWT check, sets req.user
-  middleware/adminAuth.js     403 unless req.user.isAdmin
-  middleware/errorHandler.js  JSON 404 and error responses
-  controllers/user/           register, login, me, changePassword, allUsers, Google users
-  routes/                     public, api, admin, oauth routers
-tests/                        Jest + Supertest, in-memory SQLite
-```
-
-Source files use ES module syntax compiled by Babel at runtime through `@babel/register`, as the original project did.
-
-## API
-
-All JSON responses share one shape:
-
-```json
-{ "code": 200, "success": true, "data": { } }
-{ "code": 401, "success": false, "data": null, "errorMessage": "Token is not provided" }
-```
-
-| Method | Path | Auth | Body or query | Success |
-| --- | --- | --- | --- | --- |
-| GET | `/pub/PING` | none | | `PONG` as text |
-| POST | `/pub/user/register` | none | `email`, `password` (8+ chars), optional `firstName`, `lastName` | 201, `{ user }` |
-| POST | `/pub/user/login` | none | `email`, `password` | 200, `{ user, token }` |
-| GET | `/api/me` | `x-token` | | 200, `{ user }` |
-| POST | `/api/changePassword` | `x-token` | `oldPassword`, `newPassword` (8+ chars) | 200 |
-| GET | `/api/admin/allUsers` | `x-token`, admin | `?page=1&limit=20` (max 100) | 200, `{ users, page, limit, total, totalPages }` |
-| GET | `/oauth/google` | none | | redirect to Google |
-| GET | `/oauth/google/callback` | Google | | 200 `{ user, token }`, or redirect to `CLIENT_OAUTH_REDIRECT#token=…` |
-
-Error codes:
-
-| Status | When |
-| --- | --- |
-| 400 | Missing or invalid fields, malformed JSON |
-| 401 | No token, bad or expired token, wrong credentials |
-| 403 | Signed in but not an admin |
-| 404 | Unknown route |
-| 409 | Email already registered |
-| 503 | Google sign-in called while it is not configured |
-
-Emails are stored lowercase, so login and duplicate checks ignore case. Login returns the same message for an unknown email and a wrong password, so it cannot be used to discover which emails are registered.
-
-### Example session
+### With Docker (Postgres included)
 
 ```bash
-curl -X POST localhost:8080/pub/user/register -H 'content-type: application/json' \
-  -d '{"email":"ada@example.com","password":"analytical-engine"}'
-
-TOKEN=$(curl -s -X POST localhost:8080/pub/user/login -H 'content-type: application/json' \
-  -d '{"email":"ada@example.com","password":"analytical-engine"}' | jq -r .data.token)
-
-curl localhost:8080/api/me -H "x-token: $TOKEN"
+git clone https://github.com/Mishallic/aspiration-server.git
+cd aspiration-server
+cp example.env .env
+docker compose up
 ```
 
-To make a user an admin, set the `isAdmin` column to true in the database. There is deliberately no API for it.
+The server comes up at **http://localhost:8080** with a Postgres database wired in by the compose file. Nothing else to install or configure. Migrations run automatically on start.
+
+### With local Node (zero config)
+
+Requires Node 22+.
+
+```bash
+npm install
+npm start
+```
+
+The server starts at **http://localhost:8080**. With no `DATABASE_URL` set it uses a local SQLite file (`./data/auth.sqlite`), so there is no database to set up for development.
+
+### Try it with curl
+
+Sign up a user:
+
+```bash
+curl -s -X POST http://localhost:8080/v1/auth/signup \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@example.com","password":"correct-horse-battery-staple"}'
+```
+
+The response includes the new user, an `accessToken` and a `refreshToken`:
+
+```json
+{
+  "user": { "id": "...", "email": "you@example.com", "role": "user", "emailVerified": false },
+  "accessToken": "eyJhbGciOiJSUzI1Ni...",
+  "refreshToken": "rt_...",
+  "expiresIn": 900
+}
+```
+
+Call an authenticated endpoint with the access token:
+
+```bash
+curl -s http://localhost:8080/v1/me \
+  -H 'authorization: Bearer <accessToken>'
+```
+
+### Make a user an admin
+
+With Docker:
+
+```bash
+docker compose exec app node src/cli.js make-admin you@example.com
+```
+
+Without Docker:
+
+```bash
+node src/cli.js make-admin you@example.com
+```
+
+The user's role becomes `admin` and their existing sessions are signed out so the new role takes effect on the next sign-in.
+
+## How token verification works
+
+The auth server holds a **private RS256 key** and signs every access token with it. It publishes the matching **public key** at `/.well-known/jwks.json`.
+
+Your other backends never share a secret with the auth server and never call it to check a token. They fetch the JWKS once, cache it, and verify tokens locally. Any language with a JWT library can do this. Verification checks the signature, the issuer (`PUBLIC_URL`) and the audience (`JWT_AUDIENCE`, which defaults to `app`).
+
+Here is a Node example using `jose`:
+
+```js
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const PUBLIC_URL = 'https://auth.example.com';
+const JWKS = createRemoteJWKSet(new URL(`${PUBLIC_URL}/.well-known/jwks.json`));
+
+export async function verifyToken(token) {
+  const { payload } = await jwtVerify(token, JWKS, {
+    issuer: PUBLIC_URL,
+    audience: 'app', // JWT_AUDIENCE
+  });
+  return payload;
+}
+```
+
+Access tokens carry these claims:
+
+| Claim | Meaning |
+| --- | --- |
+| `sub` | User id |
+| `email` | User email |
+| `email_verified` | Whether the email is verified |
+| `role` | `user` or `admin` |
+| `iss`, `aud`, `iat`, `exp`, `jti` | Standard issuer, audience, issued-at, expiry and token id |
+
+## Using the JavaScript SDK
+
+The SDK lives in `sdk/` (import path `sdk/index.js`). It has no dependencies and works in the browser and in Node.
+
+```js
+import { createAuthClient } from 'aspiration-server/sdk';
+
+const auth = createAuthClient({ baseUrl: 'https://auth.example.com' });
+
+await auth.signUp({ email: 'you@example.com', password: 'correct-horse-battery-staple' });
+await auth.signIn({ email: 'you@example.com', password: 'correct-horse-battery-staple' });
+
+const user = auth.getUser();
+
+// Calls your own API with the bearer token attached, refreshing the access token automatically.
+const res = await auth.fetchWithAuth('https://your-api.example.com/things');
+
+await auth.signOut();
+```
+
+The SDK stores tokens for you (localStorage in the browser, in-memory in Node) and refreshes the access token automatically before it expires and once more if a `fetchWithAuth` call comes back `401`. Fuller SDK docs are in [`sdk/README.md`](sdk/README.md).
+
+## API overview
+
+All application endpoints are under `/v1`. Errors use a uniform shape:
+
+```json
+{ "error": { "code": "invalid_credentials", "message": "Incorrect email or password", "details": {} } }
+```
+
+`code` is stable and machine-readable; `message` is for humans. `details` is optional. The full specification is in [`openapi.yaml`](openapi.yaml).
+
+### Auth
+
+| Method | Path | Purpose | Bearer |
+| --- | --- | --- | --- |
+| POST | `/v1/auth/signup` | Create an account, return tokens | No |
+| POST | `/v1/auth/login` | Sign in with email and password | No |
+| POST | `/v1/auth/refresh` | Exchange a refresh token for a new token pair | No |
+| POST | `/v1/auth/logout` | Revoke a refresh token | No |
+
+### Email
+
+| Method | Path | Purpose | Bearer |
+| --- | --- | --- | --- |
+| POST | `/v1/auth/verify-email` | Confirm an email with a token | No |
+| POST | `/v1/auth/verify-email/resend` | Resend the verification email | No |
+| POST | `/v1/auth/password/forgot` | Request a password reset email | No |
+| POST | `/v1/auth/password/reset` | Set a new password with a reset token | No |
+
+### OAuth
+
+| Method | Path | Purpose | Bearer |
+| --- | --- | --- | --- |
+| GET | `/v1/auth/oauth/providers` | List configured providers and their modes | No |
+| POST | `/v1/auth/oauth/{provider}/native` | Native sign-in with a provider ID token | No |
+| GET | `/v1/auth/oauth/{provider}/start` | Begin the web redirect flow | No |
+| GET | `/v1/auth/oauth/{provider}/callback` | Provider redirect target | No |
+| POST | `/v1/auth/oauth/exchange` | Trade a one-time app code for tokens | No |
+
+### Account
+
+| Method | Path | Purpose | Bearer |
+| --- | --- | --- | --- |
+| GET | `/v1/me` | Get the current user | Yes |
+| PATCH | `/v1/me` | Update the current user's profile | Yes |
+| DELETE | `/v1/me` | Delete the current account | Yes |
+| POST | `/v1/me/change-password` | Change the password | Yes |
+| GET | `/v1/me/sessions` | List active sessions | Yes |
+| POST | `/v1/me/logout-all` | Sign out of every session | Yes |
+
+### Admin
+
+| Method | Path | Purpose | Bearer |
+| --- | --- | --- | --- |
+| GET | `/v1/admin/users` | List users (paged, searchable) | Yes (admin) |
+| GET | `/v1/admin/users/{id}` | Get one user | Yes (admin) |
+| PATCH | `/v1/admin/users/{id}/role` | Change a user's role | Yes (admin) |
+| DELETE | `/v1/admin/users/{id}` | Delete a user | Yes (admin) |
+
+### Discovery
+
+| Method | Path | Purpose | Bearer |
+| --- | --- | --- | --- |
+| GET | `/health` | Liveness and database check | No |
+| GET | `/.well-known/jwks.json` | Public signing keys (JWKS) | No |
+| GET | `/.well-known/openid-configuration` | Issuer and JWKS metadata | No |
+
+## Configuration
+
+Configuration comes from environment variables. It is **validated at startup**, and the server **refuses to start on unsafe production settings** (for example an `http` `PUBLIC_URL` in production, or a `WEBHOOK_URL` without a sufficiently long `WEBHOOK_SECRET`).
+
+### Core
+
+| Variable | What it does | Default | Required in prod |
+| --- | --- | --- | --- |
+| `NODE_ENV` | `development`, `test` or `production` | `development` | Recommended |
+| `PORT` | Port to listen on | `8080` | No |
+| `PUBLIC_URL` | Public base URL; also the JWT issuer | `http://localhost:8080` | Yes (https) |
+| `DATABASE_URL` | Database connection string | SQLite file `./data/auth.sqlite` | Yes (Postgres) |
+| `TRUST_PROXY` | Express trust-proxy setting (e.g. `1`) when behind a proxy | unset | If proxied |
+| `CORS_ORIGINS` | Comma-separated allowed browser origins | empty | For browser apps |
+| `APP_NAME` | App name used in emails | `Your app` | No |
+
+### Tokens
+
+| Variable | What it does | Default | Required in prod |
+| --- | --- | --- | --- |
+| `JWT_AUDIENCE` | Audience claim your backends check | `app` | No |
+| `ACCESS_TOKEN_TTL_SECONDS` | Access token lifetime in seconds (60–86400) | `900` | No |
+| `REFRESH_TOKEN_TTL_DAYS` | Refresh token lifetime in days (1–365) | `30` | No |
+| `SIGNING_KEY` | Pinned RS256 private key (PEM). If unset, a key is generated and persisted in the DB | unset | Optional |
+
+### Email / SMTP
+
+| Variable | What it does | Default | Required in prod |
+| --- | --- | --- | --- |
+| `REQUIRE_EMAIL_VERIFICATION` | Require a verified email before sign-in | `false` | No |
+| `SMTP_URL` | SMTP connection URL for sending email | unset | To send email |
+| `EMAIL_FROM` | From header on outgoing email | `Auth <no-reply@localhost>` | No |
+| `PASSWORD_RESET_URL` | Front-end URL that handles reset links | unset | No |
+| `EMAIL_VERIFIED_REDIRECT_URL` | Where to send users after verifying | unset | No |
+
+### OAuth providers
+
+Set credentials only for the providers you use. Google and GitHub each require their id and secret to be set together.
+
+| Variable | What it does | Default | Required in prod |
+| --- | --- | --- | --- |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google web OAuth credentials (set together) | unset | For Google web |
+| `GOOGLE_NATIVE_CLIENT_IDS` | Comma-separated Google client IDs accepted for native ID tokens | empty | For Google mobile |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub web OAuth credentials (set together) | unset | For GitHub web |
+| `APPLE_CLIENT_IDS` | Comma-separated Apple client IDs accepted for native ID tokens | empty | For Apple mobile |
+
+For **web** sign-in, register this redirect/callback URI with the provider:
+
+```
+${PUBLIC_URL}/v1/auth/oauth/{provider}/callback
+```
+
+and register each allowed client return URL in `ALLOWED_REDIRECT_URLS` (see below). For **native** sign-in, the mobile app obtains the ID token through the provider SDK and posts it; the client IDs it uses must be listed in `GOOGLE_NATIVE_CLIENT_IDS` / `APPLE_CLIENT_IDS`.
+
+### Redirects, webhooks and rate limiting
+
+| Variable | What it does | Default | Required in prod |
+| --- | --- | --- | --- |
+| `ALLOWED_REDIRECT_URLS` | Comma-separated allowlist of OAuth client return URLs | empty | For OAuth web |
+| `WEBHOOK_URL` | URL to receive signed `user.created` / `user.deleted` events | unset | No |
+| `WEBHOOK_SECRET` | Secret used to sign webhooks; min 24 chars, required when `WEBHOOK_URL` is set | unset | With webhooks |
+| `RATE_LIMIT_ENABLED` | Toggle built-in rate limiting | `true` | No |
+
+## Security
+
+- Passwords are hashed with **Argon2id** using OWASP-recommended parameters.
+- Refresh tokens and one-time tokens are stored only as **SHA-256 hashes**, never in plaintext.
+- **Refresh-token rotation** with reuse detection: reusing a rotated token revokes the entire token family and signs the user out everywhere, so a stolen access token stops working too.
+- **Account lockout** throttles wrong-password guessing, but the correct password always signs in and clears the lock, so an attacker cannot lock a victim out.
+- **Rate limiting** per IP and per email address, so no single address or inbox can be flooded.
+- OAuth uses a **redirect allowlist**, a **single-use state token bound to the browser with an HttpOnly cookie** (login-CSRF protection) and a **one-time app code**; no tokens are ever placed in redirect URLs.
+- Accounts link to a provider only on a **provider-verified email**, and never auto-merge into a pre-existing password account that was not itself verified (pre-registration takeover guard). Native ID tokens are checked for signature, issuer, audience and freshness; a client-supplied `nonce` is verified when present.
+- **helmet** security headers; **secure cookies** are set automatically when `PUBLIC_URL` is https.
+- **Uniform responses and timing** that never reveal whether an email is registered: resend, forgot-password and logout always succeed, and a wrong password always returns the same generic error. The email-sending work runs after the response so it cannot be timed.
+- **Startup config validation** blocks unsafe production settings before the server accepts traffic.
+
+One deliberate tradeoff: **sign-up returns `409` for an email that is already registered**, which a determined caller can use to tell whether an address has an account. This is the near-universal behaviour (you cannot let someone register a taken address without telling them), and the alternative needs reliable email and worsens the sign-up experience. Sign-up is rate limited; if you need enumeration-resistant sign-up, put it behind an invite or email-confirmation step.
+
+Signing keys live in the database. Rotate them without downtime:
+
+```bash
+node src/cli.js rotate-key
+```
+
+The old key stays published in the JWKS until the next rotation, so tokens signed with it keep verifying. Alternatively, pin a fixed key with the `SIGNING_KEY` environment variable.
+
+## Running in production
+
+- Use **Postgres**: set `DATABASE_URL` to your connection string.
+- Set a strong `SIGNING_KEY`, or let the server generate one and persist it in the database.
+- Set `PUBLIC_URL` to your public **https** URL (the server refuses an `http` URL in production).
+- Set `CORS_ORIGINS` to your front-end origins and `ALLOWED_REDIRECT_URLS` to your OAuth return URLs.
+- Terminate **TLS** in front of the server, and set `TRUST_PROXY` when it runs behind a reverse proxy or load balancer.
+- Migrations run automatically on start (Umzug). You can also run them manually with `npm run migrate`.
 
 ## Tests
 
 ```bash
-npm test
+npm test     # vitest
+npm run lint # eslint
 ```
 
-62 tests across 6 suites run against an in-memory SQLite database, so they need no setup:
+The suite covers the email/password flows, refresh-token rotation and reuse detection, OAuth (with stubbed providers), rate limiting and account lockout, and verification of issued tokens through JWKS exactly as a third-party backend would.
 
-- **app**: health check, JSON 404 for unknown routes, 400 for malformed JSON.
-- **responses**: helpers send the status they are given, 500s hide internals, client errors keep their message.
-- **helpers**: bcrypt hashing and salting, JWT round trip, expiry and forgery, email validation, secret stripping.
-- **auth**: register validation and duplicates, case-insensitive email, no self-assigned admin, login, `/api/me`, forged, expired and deleted-user tokens, the full change-password flow.
-- **admin**: 401 and 403 gates, pagination and page-size cap, no secrets in the listing.
-- **oauth**: Google user creation, repeat sign-in, account linking, missing email, 503 when Google is not configured.
+## Project layout
 
-## What changed from the 2021 version
-
-The 2021 code had these defects, each now covered by a test:
-
-- **`/pub/user/me` handed out a valid token for any user id**, with no authentication. It is replaced by the authenticated `GET /api/me`.
-- **Passwords were hashed with unsalted MD5.** They now use bcrypt.
-- **`changePassword` always crashed** with a `ReferenceError`, because it read `oldPassword` and `newPassword` as undefined variables.
-- **Every error returned HTTP 500**, including bad logins and missing tokens, because the error helper ignored its status argument.
-- **Admin pagination never worked**, because it read `req.params.page` on a route with no page parameter, with a page size of 2.
-- **Google sign-in issued no token.** It redirected with the raw Google id, which the client then traded at the open `/me` endpoint. The callback now issues a JWT itself.
-- **Tokens never expired.** They now expire after 7 days by default.
-- **`login` answered Google users with HTTP 306**, a status code that is reserved and unused.
-
-Also removed: the unused `googleapis` flow built on the retired Google+ API, the commented-out proxy, `stresstest.js` (which fired 100 requests at a hardcoded public IP), an empty migration, and the `fs` and `path` npm packages, which shadow Node built-ins. Dependencies were upgraded, including Express 4 to 5, jsonwebtoken 8 to 9, mysql2 2 to 3 and Sequelize 6.6 to 6.37.
-
-## Limits
-
-- **Schema management uses `sync()`**, which creates missing tables but does not alter existing ones. A production database with real data should move to Sequelize migrations before the schema changes.
-- **Accounts created before this version cannot log in.** Their MD5 hashes are not bcrypt hashes. They need a password reset, and there is no reset flow yet.
-- **Logout is client-side.** JWTs are stateless, so a stolen token works until it expires. Shorten `JWT_EXPIRES_IN` if that matters.
-- **No rate limiting.** Put the server behind a proxy that rate-limits `/pub/user/login`, or add `express-rate-limit`.
-- **One dev-only audit warning remains**, in `sprintf-js` inside Jest's coverage tooling. It has no upstream fix and does not ship. Production dependencies audit clean.
-
-## Deliberately left out
-
-- **Email verification and password reset.** The model has `isVerified` and `verifyToken`, but sending email needs a mail provider and a client screen to land on.
-- **Refresh tokens.** One token with an expiry is enough for this scope.
-- **The mobile client.** The original app is not in this repository or any other, so the API was kept close to its 2021 shape. The two changes a client would notice are `/api/me` replacing `/pub/user/me` and Google sign-in returning a token.
-- **A public deployment.** There is no client to use it, so the target is a server that runs locally with zero setup.
-
-## Run locally
-
-Requires Node 20 or newer.
-
-```bash
-npm install
-cp example.env .env   # optional; defaults work for local use
-npm run dev           # restarts on file changes
-# or
-npm start
+```
+src/
+  config.js       Environment parsing and production safety checks
+  server.js       Process entry point: load config, build app, listen
+  app.js          Express app: middleware, routes, error handling
+  context.js      Wires config, database, services and rate limits together
+  cli.js          Admin CLI: migrate, make-admin, remove-admin, rotate-key
+  db/             Sequelize setup, models and Umzug migrations
+  lib/            Crypto, password hashing, errors, validation, user helpers
+  services/       Sessions, keys, accounts, email flows, OAuth, webhooks, mailer
+  routes/         HTTP route handlers per area
+  middleware/     Auth, rate limiting and error middleware
+  pages/          Minimal HTML pages for email links
+sdk/              JavaScript client (createAuthClient)
+tests/            vitest suite
+openapi.yaml      Full API specification
+Dockerfile        Container image
+docker-compose.yml  App plus Postgres for local and simple deploys
 ```
 
-The server listens on `http://localhost:8080` and stores data in `./dev.sqlite`.
+## License
 
-To enable Google sign-in, create an OAuth client in Google Cloud Console and add `http://localhost:8080/oauth/google/callback` as an authorized redirect URI. Then set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`.
-
-## Deploy
-
-The server is a long-running Node process, so it suits Render, Railway, Fly.io or a VPS rather than serverless hosting.
-
-1. Create a Postgres or MySQL database.
-2. Set `NODE_ENV=production`, a long random `SECRET`, `CORS_ORIGIN` set to your client's origin, and either `DB_CONNECTION_STRING` with `DB_DIALECT`, or the separate `DB_*` fields. The server refuses to start in production without `SECRET`.
-3. For Google sign-in, set the `GOOGLE_*` variables, with `GOOGLE_CALLBACK_URL` pointing at the public `/oauth/google/callback`, and register that URL with Google.
-4. Run `npm ci --omit=dev && npm start`.
-
-See `example.env` for every variable.
+ISC.
