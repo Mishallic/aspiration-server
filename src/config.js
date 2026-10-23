@@ -120,9 +120,11 @@ export function loadConfig(env = process.env) {
       github: e.GITHUB_CLIENT_ID
         ? Object.freeze({ clientId: e.GITHUB_CLIENT_ID, clientSecret: e.GITHUB_CLIENT_SECRET })
         : null,
-      googleNativeClientIds: Object.freeze(
-        [...new Set([...(e.GOOGLE_CLIENT_ID ? [e.GOOGLE_CLIENT_ID] : []), ...e.GOOGLE_NATIVE_CLIENT_IDS])],
-      ),
+      // Only the explicit native/mobile client IDs. The confidential web client ID is
+      // deliberately NOT folded in: an ID token minted for the web code flow must not
+      // also be accepted at the native endpoint. Add it to GOOGLE_NATIVE_CLIENT_IDS if
+      // a browser Google Sign-In genuinely posts its token to /native.
+      googleNativeClientIds: Object.freeze([...new Set(e.GOOGLE_NATIVE_CLIENT_IDS)]),
       appleClientIds: Object.freeze(e.APPLE_CLIENT_IDS),
     }),
     webhook: e.WEBHOOK_URL ? Object.freeze({ url: e.WEBHOOK_URL, secret: e.WEBHOOK_SECRET }) : null,

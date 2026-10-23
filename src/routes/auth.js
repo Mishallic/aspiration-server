@@ -1,6 +1,6 @@
 import express from 'express';
 import { z } from 'zod';
-import { conflict, forbidden, tooManyRequests, unauthorized } from '../lib/errors.js';
+import { conflict, forbidden, unauthorized } from '../lib/errors.js';
 import { hashPassword, verifyPassword } from '../lib/passwords.js';
 import { toPublicUser } from '../lib/users.js';
 import { emailSchema, loginPasswordSchema, nameSchema, parse, passwordSchema } from '../lib/validation.js';
@@ -58,18 +58,21 @@ export function authRoutes(ctx) {
   router.post('/login', rateLimits.credentials, async (req, res) => {
     const input = parse(loginSchema, req.body);
     const user = await User.findOne({ where: { email: input.email } });
+    const locked = Boolean(user?.lockedUntil && user.lockedUntil > new Date());
 
-    if (user?.lockedUntil && user.lockedUntil > new Date()) {
-      const seconds = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000);
-      throw tooManyRequests('account_locked', 'Too many failed sign-in attempts. Try again later.', seconds);
-    }
-
+    // Always run a password verification (a dummy hash when the user or password is
+    // absent), so response time does not reveal whether the account exists or is
+    // locked. The lock state is never surfaced to an unauthenticated caller.
     const valid = await verifyPassword(user?.passwordHash, input.password);
     if (!valid) {
-      if (user) await recordFailedLogin(user);
+      // Count failures only while not already locked, so an attacker cannot keep
+      // extending the lock. Same generic answer whether or not the account exists.
+      if (user && !locked) await recordFailedLogin(user);
       throw unauthorized('invalid_credentials', 'Incorrect email or password');
     }
 
+    // The correct password always signs in and clears any lock. Lockout throttles
+    // wrong guesses; it must never lock out the real owner (a targeted-lockout DoS).
     if (user.failedLoginCount || user.lockedUntil) {
       await user.update({ failedLoginCount: 0, lockedUntil: null });
     }
@@ -81,6 +84,9 @@ export function authRoutes(ctx) {
     return res.json({ user: toPublicUser(user), ...session });
   });
 
+  // Records a failed attempt and locks the account once the threshold is reached.
+  // The lock only suppresses further failure counting; a correct password still
+  // signs in (see /login), so this cannot be used to lock a victim out.
   async function recordFailedLogin(user) {
     await user.increment('failedLoginCount');
     await user.reload();

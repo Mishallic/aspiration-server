@@ -1,5 +1,6 @@
 import { createLocalJWKSet, decodeJwt, jwtVerify } from 'jose';
 import { badRequest, serviceUnavailable } from '../lib/errors.js';
+import { safeEqual } from '../lib/crypto.js';
 
 const JWKS_TTL_MS = 60 * 60 * 1000;
 
@@ -37,29 +38,39 @@ export function createOAuthProviders({ config, fetchImpl }) {
     return set;
   }
 
-  async function verifyProviderJwt(idToken, { jwksUrl, issuer, issuers, audiences }) {
+  async function verifyProviderJwt(idToken, { jwksUrl, issuer, issuers, audiences, maxTokenAge, expectedNonce }) {
     if (!audiences.length) throw badRequest('provider_not_configured', 'This provider is not configured');
+    let payload;
     try {
-      const { payload } = await jwtVerify(idToken, await keySet(jwksUrl), {
+      ({ payload } = await jwtVerify(idToken, await keySet(jwksUrl), {
         issuer: issuer ?? issuers,
         audience: audiences,
-      });
-      return payload;
+        // Bounds replay of a captured ID token: the provider mints a fresh one at sign-in.
+        ...(maxTokenAge ? { maxTokenAge } : {}),
+      }));
     } catch (err) {
       if (err.status === 503) throw err;
       throw badRequest('invalid_provider_token', 'The provider identity token is invalid');
     }
+    // Optional freshness binding: when the client generates a nonce, passes it to the
+    // provider SDK and sends it with the request, it must match the token's nonce claim.
+    if (expectedNonce && (typeof payload.nonce !== 'string' || !safeEqual(payload.nonce, expectedNonce))) {
+      throw badRequest('invalid_provider_token', 'The provider identity token is invalid');
+    }
+    return payload;
   }
 
   const google = {
     hasWeb: () => Boolean(config.oauth.google),
     hasNative: () => config.oauth.googleNativeClientIds.length > 0,
 
-    async verifyNativeToken(idToken) {
+    async verifyNativeToken(idToken, { nonce } = {}) {
       const p = await verifyProviderJwt(idToken, {
         jwksUrl: GOOGLE.jwksUrl,
         issuers: GOOGLE.issuers,
         audiences: config.oauth.googleNativeClientIds,
+        maxTokenAge: '10m',
+        expectedNonce: nonce,
       });
       return profileFromGoogle(p);
     },
@@ -105,11 +116,13 @@ export function createOAuthProviders({ config, fetchImpl }) {
   const apple = {
     hasWeb: () => false,
     hasNative: () => config.oauth.appleClientIds.length > 0,
-    async verifyNativeToken(idToken) {
+    async verifyNativeToken(idToken, { nonce } = {}) {
       const p = await verifyProviderJwt(idToken, {
         jwksUrl: APPLE.jwksUrl,
         issuer: APPLE.issuer,
         audiences: config.oauth.appleClientIds,
+        maxTokenAge: '10m',
+        expectedNonce: nonce,
       });
       return {
         provider: 'apple',

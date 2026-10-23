@@ -13,7 +13,9 @@ export function requireAuth({ models, services }) {
     const payload = await services.sessions.verifyAccessToken(match[1]);
     const user = await models.User.findByPk(payload.sub);
     if (!user) throw unauthorized('invalid_token', 'Access token is invalid');
-    if (user.tokensValidAfter && payload.iat < Math.floor(user.tokensValidAfter.getTime() / 1000)) {
+    // iat is floored to the second; compare in milliseconds and reject ties so a token
+    // minted in the same second as a revocation does not slip through.
+    if (user.tokensValidAfter && payload.iat * 1000 < user.tokensValidAfter.getTime()) {
       throw unauthorized('token_revoked', 'Access token has been revoked');
     }
 

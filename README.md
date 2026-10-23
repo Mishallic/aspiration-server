@@ -276,14 +276,16 @@ and register each allowed client return URL in `ALLOWED_REDIRECT_URLS` (see belo
 
 - Passwords are hashed with **Argon2id** using OWASP-recommended parameters.
 - Refresh tokens and one-time tokens are stored only as **SHA-256 hashes**, never in plaintext.
-- **Refresh-token rotation** with reuse detection: reusing a rotated token revokes the entire token family.
-- **Account lockout** after repeated failed sign-ins, with a timed unlock.
+- **Refresh-token rotation** with reuse detection: reusing a rotated token revokes the entire token family and signs the user out everywhere, so a stolen access token stops working too.
+- **Account lockout** throttles wrong-password guessing, but the correct password always signs in and clears the lock, so an attacker cannot lock a victim out.
 - **Rate limiting** per IP and per email address, so no single address or inbox can be flooded.
-- OAuth uses a **redirect allowlist**, a **single-use state token** and a **one-time app code**; no tokens are ever placed in redirect URLs.
-- Accounts are linked to a provider only on a **provider-verified email**.
+- OAuth uses a **redirect allowlist**, a **single-use state token bound to the browser with an HttpOnly cookie** (login-CSRF protection) and a **one-time app code**; no tokens are ever placed in redirect URLs.
+- Accounts link to a provider only on a **provider-verified email**, and never auto-merge into a pre-existing password account that was not itself verified (pre-registration takeover guard). Native ID tokens are checked for signature, issuer, audience and freshness; a client-supplied `nonce` is verified when present.
 - **helmet** security headers; **secure cookies** are set automatically when `PUBLIC_URL` is https.
-- **Uniform responses** that never reveal whether an email is registered (resend, forgot-password and logout always succeed).
+- **Uniform responses and timing** that never reveal whether an email is registered: resend, forgot-password and logout always succeed, and a wrong password always returns the same generic error. The email-sending work runs after the response so it cannot be timed.
 - **Startup config validation** blocks unsafe production settings before the server accepts traffic.
+
+One deliberate tradeoff: **sign-up returns `409` for an email that is already registered**, which a determined caller can use to tell whether an address has an account. This is the near-universal behaviour (you cannot let someone register a taken address without telling them), and the alternative needs reliable email and worsens the sign-up experience. Sign-up is rate limited; if you need enumeration-resistant sign-up, put it behind an invite or email-confirmation step.
 
 Signing keys live in the database. Rotate them without downtime:
 

@@ -22,20 +22,28 @@ export function emailRoutes(ctx) {
     res.json({ user: toPublicUser(user) });
   });
 
+  // Respond 204 first, then do the lookup and token work off the request path (via
+  // ctx.background). The response time is therefore independent of whether the address
+  // has an account, so it cannot be timed to tell registered addresses from unknown ones.
+
   // Resend. Always 204: it must not reveal whether the address has an account.
-  router.post('/verify-email/resend', emailLimits, async (req, res) => {
+  router.post('/verify-email/resend', emailLimits, (req, res) => {
     const { email } = parse(emailOnlySchema, req.body);
-    const user = await User.findOne({ where: { email } });
-    if (user && !user.emailVerifiedAt) await services.emailFlows.sendVerification(user);
     res.status(204).end();
+    ctx.background.run(
+      User.findOne({ where: { email } }).then((user) =>
+        user && !user.emailVerifiedAt ? services.emailFlows.sendVerification(user) : null,
+      ),
+    );
   });
 
   // Request a reset. Always 204, for the same reason.
-  router.post('/password/forgot', emailLimits, async (req, res) => {
+  router.post('/password/forgot', emailLimits, (req, res) => {
     const { email } = parse(emailOnlySchema, req.body);
-    const user = await User.findOne({ where: { email } });
-    if (user) await services.emailFlows.sendPasswordReset(user);
     res.status(204).end();
+    ctx.background.run(
+      User.findOne({ where: { email } }).then((user) => (user ? services.emailFlows.sendPasswordReset(user) : null)),
+    );
   });
 
   router.post('/password/reset', rateLimits.tokenUse, async (req, res) => {

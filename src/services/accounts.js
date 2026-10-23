@@ -1,3 +1,4 @@
+import { conflict } from '../lib/errors.js';
 import { toPublicUser, normalizeEmail } from '../lib/users.js';
 
 // Turns a verified provider profile into a local user, shared by every OAuth path
@@ -24,10 +25,22 @@ export function createAccountService({ sequelize, models, services }) {
         return { user, created: false };
       }
 
-      // 2. Link to an existing local account, but only on a provider-verified email.
+      // 2. Link to an existing local account, but only on a provider-verified email
+      // AND only when that account is itself trustworthy. Auto-merging a verified
+      // provider identity into an account that has a password but was never
+      // email-verified would let an attacker pre-register the victim's address with
+      // a password, then inherit the account when the victim signs in with the
+      // provider. Such an account must prove control (sign in with the password)
+      // before a provider identity is attached.
       if (email && emailVerified) {
         const user = await User.findOne({ where: { email }, transaction });
         if (user) {
+          if (user.passwordHash && !user.emailVerifiedAt) {
+            throw conflict(
+              'account_exists',
+              'An account with this email already exists. Sign in with your password to link this provider.',
+            );
+          }
           await Identity.create(
             { userId: user.id, provider, providerUserId, email },
             { transaction },

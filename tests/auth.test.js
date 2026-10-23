@@ -105,26 +105,29 @@ describe('login and lockout', () => {
     expect(wrong.body).toEqual(unknown.body);
   });
 
-  test('locks the account after repeated failures, even for the right password', async () => {
+  test('repeated wrong passwords lock the account, but always answer with a generic 401', async () => {
     await signUp(t.app, { email: 'target@example.com' });
     for (let i = 0; i < MAX_FAILED_LOGINS; i += 1) {
-
       await login({ email: 'target@example.com', password: 'guess' });
     }
-    const locked = await login({ email: 'target@example.com', password: PASSWORD });
-    expect(locked.status).toBe(429);
-    expect(locked.body.error.code).toBe('account_locked');
-    expect(Number(locked.headers['retry-after'])).toBeGreaterThan(0);
+    const user = await t.ctx.models.User.findOne({ where: { email: 'target@example.com' } });
+    expect(user.lockedUntil).toBeInstanceOf(Date);
+
+    // A wrong password while locked still gets the same generic answer: the lock state
+    // is never surfaced to an unauthenticated caller (no enumeration, no 429 oracle).
+    const stillWrong = await login({ email: 'target@example.com', password: 'guess' });
+    expect(stillWrong.status).toBe(401);
+    expect(stillWrong.body.error.code).toBe('invalid_credentials');
   });
 
-  test('the lock expires and a successful login clears the counter', async () => {
+  test('the correct password always signs in and clears the lock (no targeted lockout DoS)', async () => {
     const user = await t.ctx.models.User.findOne({ where: { email: 'target@example.com' } });
-    await user.update({ lockedUntil: new Date(Date.now() - 1000), failedLoginCount: 3 });
+    await user.update({ lockedUntil: new Date(Date.now() + 10 * 60_000), failedLoginCount: 0 });
     const res = await login({ email: 'target@example.com', password: PASSWORD });
     expect(res.status).toBe(200);
     await user.reload();
-    expect(user.failedLoginCount).toBe(0);
     expect(user.lockedUntil).toBeNull();
+    expect(user.failedLoginCount).toBe(0);
   });
 
   test('a user without a password (social sign-in only) cannot log in with one', async () => {

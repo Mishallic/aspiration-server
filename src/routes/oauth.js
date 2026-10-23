@@ -1,6 +1,7 @@
 import express from 'express';
 import { z } from 'zod';
 import { badRequest, notFound } from '../lib/errors.js';
+import { safeEqual } from '../lib/crypto.js';
 import { toPublicUser } from '../lib/users.js';
 import { parse } from '../lib/validation.js';
 import { PURPOSES } from '../services/oneTimeTokens.js';
@@ -8,9 +9,15 @@ import { requestMeta } from './auth.js';
 
 const OAUTH_STATE_TTL = 600;
 const OAUTH_CODE_TTL = 120;
+const STATE_COOKIE = 'oauth_state';
+const COOKIE_PATH = '/v1/auth/oauth';
 const PROVIDERS = new Set(['google', 'github', 'apple']);
 
-const nativeSchema = z.object({ idToken: z.string().min(10).max(8192) });
+const nativeSchema = z.object({
+  idToken: z.string().min(10).max(8192),
+  // Optional freshness binding; recommended for native clients (see docs).
+  nonce: z.string().min(1).max(256).optional(),
+});
 const exchangeSchema = z.object({ code: z.string().min(20).max(200) });
 
 function assertProvider(name) {
@@ -52,8 +59,8 @@ export function oauthRoutes(ctx) {
     const impl = services.oauthProviders.get(req.params.provider);
     if (!impl.hasNative()) throw badRequest('provider_not_configured', 'Native sign-in is not configured');
 
-    const { idToken } = parse(nativeSchema, req.body);
-    const profile = await impl.verifyNativeToken(idToken);
+    const { idToken, nonce } = parse(nativeSchema, req.body);
+    const profile = await impl.verifyNativeToken(idToken, { nonce });
     const { user, session } = await services.accounts.signInWithProvider(profile, requestMeta(req));
     res.json({ user: toPublicUser(user), ...session });
   });
@@ -73,6 +80,16 @@ export function oauthRoutes(ctx) {
       data: { provider: req.params.provider, redirectUri },
       ttlSeconds: OAUTH_STATE_TTL,
     });
+    // Bind the flow to this browser: the callback must present the same value in a
+    // cookie, so a state/code pair the attacker pre-generated cannot be redeemed in
+    // the victim's browser (login CSRF / session fixation).
+    res.cookie(STATE_COOKIE, state, {
+      httpOnly: true,
+      secure: config.secureCookies,
+      sameSite: 'lax',
+      path: COOKIE_PATH,
+      maxAge: OAUTH_STATE_TTL * 1000,
+    });
     res.redirect(impl.authorizeUrl({ state, redirectUri: callbackUrl(req.params.provider) }));
   });
 
@@ -80,9 +97,18 @@ export function oauthRoutes(ctx) {
   // in, mint a short one-time app code, and hand it to the client in the URL fragment.
   router.get('/:provider/callback', async (req, res, next) => {
     assertProvider(req.params.provider);
+    const queryState = typeof req.query.state === 'string' ? req.query.state : '';
+    const cookieState = req.cookies?.[STATE_COOKIE] ?? '';
+    res.clearCookie(STATE_COOKIE, { path: COOKIE_PATH });
+
+    // The state must match the cookie set when the flow began, then be a live,
+    // single-use token for this provider.
+    if (!cookieState || !queryState || !safeEqual(cookieState, queryState)) {
+      throw badRequest('invalid_state', 'The sign-in state is missing, expired or already used');
+    }
     const stateRecord = await services.oneTimeTokens.consume({
       purpose: PURPOSES.OAUTH_STATE,
-      raw: typeof req.query.state === 'string' ? req.query.state : '',
+      raw: queryState,
     });
     if (!stateRecord || stateRecord.data?.provider !== req.params.provider) {
       throw badRequest('invalid_state', 'The sign-in state is missing, expired or already used');
@@ -103,9 +129,11 @@ export function oauthRoutes(ctx) {
       });
       res.redirect(appendFragment(redirectUri, { code: appCode }));
     } catch (err) {
-      // Deliver provider errors to the client via the (already validated) redirect,
-      // so a user who denies consent lands back in the app instead of on a JSON page.
-      if (err.status === 400) return res.redirect(appendFragment(redirectUri, { error: err.code }));
+      // Deliver client-side errors (denied consent, an email that needs linking) to
+      // the app via the already validated redirect, instead of a JSON page.
+      if (err.status >= 400 && err.status < 500) {
+        return res.redirect(appendFragment(redirectUri, { error: err.code }));
+      }
       return next(err);
     }
   });

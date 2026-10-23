@@ -7,8 +7,6 @@ import { SIGNING_ALG } from './keys.js';
 
 const REFRESH_PREFIX = 'rt_';
 
-const wholeSecond = (date = new Date()) => new Date(Math.floor(date.getTime() / 1000) * 1000);
-
 // Access tokens: short-lived RS256 JWTs that any backend can verify with the JWKS.
 // Refresh tokens: opaque random strings stored as SHA-256 hashes, rotated on every use.
 // Presenting an already-rotated refresh token revokes its whole chain (its "family"),
@@ -83,8 +81,11 @@ export function createSessionService({ config, models, keys }) {
     const record = await RefreshToken.findOne({ where: { tokenHash: sha256(rawToken) } });
     if (!record) throw invalidRefresh();
 
+    // A revoked token being presented again means the chain was rotated and this copy
+    // was replayed (a likely theft). Sign the user out everywhere, which also bumps
+    // tokensValidAfter so any access token the thief already holds stops working here.
     if (record.revokedAt) {
-      await revokeFamily(record.familyId);
+      await revokeAllSessions(record.userId);
       throw invalidRefresh();
     }
     if (record.expiresAt <= new Date()) throw invalidRefresh();
@@ -95,7 +96,7 @@ export function createSessionService({ config, models, keys }) {
       { where: { id: record.id, revokedAt: null } },
     );
     if (claimed !== 1) {
-      await revokeFamily(record.familyId);
+      await revokeAllSessions(record.userId);
       throw invalidRefresh();
     }
 
@@ -113,19 +114,21 @@ export function createSessionService({ config, models, keys }) {
 
   // Signs the user out everywhere. Access tokens issued before now stop working on this
   // server at once; other backends that only check the JWT accept them until they expire.
+  // Stored at full precision so the middleware can reject tokens issued in the same
+  // second as the revocation (see requireAuth).
   async function revokeAllSessions(userId, { transaction } = {}) {
     await RefreshToken.update(
       { revokedAt: new Date() },
       { where: { userId, revokedAt: null }, transaction },
     );
-    await User.update({ tokensValidAfter: wholeSecond() }, { where: { id: userId }, transaction });
+    await User.update({ tokensValidAfter: new Date() }, { where: { id: userId }, transaction });
   }
 
+  // Delete a refresh token only once it has expired, never merely because it was
+  // revoked: a revoked row is the evidence that detects reuse of a stolen token, and
+  // it must live for the family's full lifetime (up to REFRESH_TOKEN_TTL_DAYS).
   async function pruneExpired() {
-    const cutoff = new Date(Date.now() - 7 * 86_400_000);
-    await RefreshToken.destroy({
-      where: { [Op.or]: [{ expiresAt: { [Op.lt]: new Date() } }, { revokedAt: { [Op.lt]: cutoff } }] },
-    });
+    await RefreshToken.destroy({ where: { expiresAt: { [Op.lt]: new Date() } } });
   }
 
   return {

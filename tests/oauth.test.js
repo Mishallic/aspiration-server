@@ -1,10 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import request from 'supertest';
 import { createTestApp, verifyLikeAThirdParty } from './helpers.js';
 import { makeFakeProvider, stubFetch } from './oauthHelpers.js';
 
 const GOOGLE_JWKS = 'https://www.googleapis.com/oauth2/v3/certs';
 const APPLE_JWKS = 'https://appleid.apple.com/auth/keys';
 const GOOGLE_CLIENT = 'google-client-id.apps.googleusercontent.com';
+const GOOGLE_NATIVE = 'ios-client-id.apps.googleusercontent.com';
 const APPLE_CLIENT = 'com.example.app';
 
 describe('native OAuth sign-in', () => {
@@ -71,30 +73,67 @@ describe('native OAuth sign-in', () => {
     expect(res.status).toBe(400);
   });
 
-  test('links a Google login to an existing account on a verified email', async () => {
-    await t.api().post('/v1/auth/signup').send({ email: 'link@example.com', password: 'password-here-ok' });
+  test('does NOT accept a token minted for the confidential web client id at the native endpoint', async () => {
     const idToken = await google.idToken(
-      { sub: 'g-link', email: 'link@example.com', email_verified: true },
+      { sub: 'g-web', email: 'web-id@gmail.com', email_verified: true },
       { aud: GOOGLE_CLIENT },
     );
     const res = await t.api().post('/v1/auth/oauth/google/native').send({ idToken });
-    expect(res.status).toBe(200);
-    const identities = await t.ctx.models.Identity.count();
-    const user = await t.ctx.models.User.findOne({ where: { email: 'link@example.com' } });
-    expect(await t.ctx.models.Identity.count({ where: { userId: user.id } })).toBe(1);
-    expect(identities).toBeGreaterThanOrEqual(1);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('invalid_provider_token');
   });
 
-  test('does NOT link on an unverified provider email (account-takeover guard)', async () => {
+  test('when a nonce is supplied it must match the token', async () => {
+    const idToken = await google.idToken(
+      { sub: 'g-nonce', email: 'nonce@gmail.com', email_verified: true, nonce: 'abc123' },
+      { aud: GOOGLE_NATIVE },
+    );
+    const bad = await t.api().post('/v1/auth/oauth/google/native').send({ idToken, nonce: 'wrong' });
+    expect(bad.status).toBe(400);
+    const good = await t.api().post('/v1/auth/oauth/google/native').send({ idToken, nonce: 'abc123' });
+    expect(good.status).toBe(200);
+  });
+
+  test('links a Google login to an existing, verified account', async () => {
+    await t.api().post('/v1/auth/signup').send({ email: 'link@example.com', password: 'password-here-ok' });
+    // The account has proven control of its email, so auto-linking is safe.
+    await t.ctx.models.User.update({ emailVerifiedAt: new Date() }, { where: { email: 'link@example.com' } });
+    const idToken = await google.idToken(
+      { sub: 'g-link', email: 'link@example.com', email_verified: true },
+      { aud: GOOGLE_NATIVE },
+    );
+    const res = await t.api().post('/v1/auth/oauth/google/native').send({ idToken });
+    expect(res.status).toBe(200);
+    const user = await t.ctx.models.User.findOne({ where: { email: 'link@example.com' } });
+    expect(res.body.user.id).toBe(user.id);
+    expect(await t.ctx.models.Identity.count({ where: { userId: user.id } })).toBe(1);
+  });
+
+  test('refuses to link into an unverified password account (pre-registration takeover guard)', async () => {
+    // Attacker pre-registers the victim's email with a password; account is unverified.
+    await t.api().post('/v1/auth/signup').send({ email: 'victim@example.com', password: 'attacker-chosen-pw' });
+    const victim = await t.ctx.models.User.findOne({ where: { email: 'victim@example.com' } });
+    // Victim later signs in with Google on the same (provider-verified) address.
+    const idToken = await google.idToken(
+      { sub: 'g-victim', email: 'victim@example.com', email_verified: true },
+      { aud: GOOGLE_NATIVE },
+    );
+    const res = await t.api().post('/v1/auth/oauth/google/native').send({ idToken });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('account_exists');
+    // No provider identity was attached to the attacker's pre-registered account.
+    expect(await t.ctx.models.Identity.findOne({ where: { userId: victim.id } })).toBeNull();
+  });
+
+  test('does NOT link on an unverified provider email, creating a separate account', async () => {
     await t.api().post('/v1/auth/signup').send({ email: 'target@example.com', password: 'password-here-ok' });
     const target = await t.ctx.models.User.findOne({ where: { email: 'target@example.com' } });
     const idToken = await google.idToken(
       { sub: 'attacker-sub', email: 'target@example.com', email_verified: false },
-      { aud: GOOGLE_CLIENT },
+      { aud: GOOGLE_NATIVE },
     );
     const res = await t.api().post('/v1/auth/oauth/google/native').send({ idToken });
     expect(res.status).toBe(200);
-    // A different user was created; the attacker did not join the victim's account.
     expect(res.body.user.id).not.toBe(target.id);
     expect(await t.ctx.models.Identity.findOne({ where: { userId: target.id } })).toBeNull();
   });
@@ -164,10 +203,13 @@ describe('web OAuth flow', () => {
     expect(location.searchParams.get('redirect_uri')).toBe(`${t.config.publicUrl}/v1/auth/oauth/google/callback`);
   });
 
+  // A persistent agent so the state cookie set by /start is sent to /callback,
+  // mirroring the same browser completing the flow.
   const runFlow = async (provider) => {
-    const start = await t.api().get(`/v1/auth/oauth/${provider}/start?redirect_uri=${encodeURIComponent(REDIRECT)}`);
+    const agent = request.agent(t.app);
+    const start = await agent.get(`/v1/auth/oauth/${provider}/start?redirect_uri=${encodeURIComponent(REDIRECT)}`);
     const state = new URL(start.headers.location).searchParams.get('state');
-    const callback = await t.api().get(`/v1/auth/oauth/${provider}/callback?code=prov-code&state=${state}`);
+    const callback = await agent.get(`/v1/auth/oauth/${provider}/callback?code=prov-code&state=${state}`);
     expect(callback.status).toBe(302);
     expect(callback.headers.location.startsWith(`${REDIRECT}#`)).toBe(true);
     return { state, code: parseFragment(callback.headers.location).get('code') };
@@ -187,7 +229,17 @@ describe('web OAuth flow', () => {
 
     // The app code is single-use, and the state cannot be replayed.
     expect((await t.api().post('/v1/auth/oauth/exchange').send({ code })).status).toBe(400);
+    // Replaying the state in a different browser (no matching cookie) is refused.
     expect((await t.api().get(`/v1/auth/oauth/google/callback?code=x&state=${state}`)).status).toBe(400);
+  });
+
+  test('a callback with a valid state but no matching cookie is refused (login-CSRF guard)', async () => {
+    const start = await t.api().get(`/v1/auth/oauth/google/start?redirect_uri=${encodeURIComponent(REDIRECT)}`);
+    const state = new URL(start.headers.location).searchParams.get('state');
+    // A fresh client (no oauth_state cookie) cannot complete someone else's flow.
+    const res = await t.api().get(`/v1/auth/oauth/google/callback?code=prov-code&state=${state}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('invalid_state');
   });
 
   test('github web flow reads the verified primary email', async () => {
@@ -204,9 +256,10 @@ describe('web OAuth flow', () => {
   });
 
   test('provider errors come back on the redirect, not as JSON', async () => {
-    const start = await t.api().get(`/v1/auth/oauth/google/start?redirect_uri=${encodeURIComponent(REDIRECT)}`);
+    const agent = request.agent(t.app);
+    const start = await agent.get(`/v1/auth/oauth/google/start?redirect_uri=${encodeURIComponent(REDIRECT)}`);
     const state = new URL(start.headers.location).searchParams.get('state');
-    const res = await t.api().get(`/v1/auth/oauth/google/callback?state=${state}`); // no code
+    const res = await agent.get(`/v1/auth/oauth/google/callback?state=${state}`); // no code
     expect(res.status).toBe(302);
     expect(parseFragment(res.headers.location).get('error')).toBe('provider_denied');
   });

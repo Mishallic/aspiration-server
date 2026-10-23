@@ -33,6 +33,7 @@ describe('email verification', () => {
     const unknown = await t.api().post('/v1/auth/verify-email/resend').send({ email: 'nobody@example.com' });
     expect(known.status).toBe(204);
     expect(unknown.status).toBe(204);
+    await t.ctx.background.flush();
     expect(lastEmail(t.ctx).to).toBe('resend@example.com');
   });
 
@@ -61,7 +62,12 @@ describe('password reset', () => {
   });
   afterAll(() => t.close());
 
-  const forgot = (email) => t.api().post('/v1/auth/password/forgot').send({ email });
+  // The email is sent in the background after the 204, so wait for it before reading.
+  const forgot = async (email) => {
+    const res = await t.api().post('/v1/auth/password/forgot').send({ email });
+    await t.ctx.background.flush();
+    return res;
+  };
 
   test('forgot is always 204 whether or not the account exists', async () => {
     expect((await forgot('reset@example.com')).status).toBe(204);

@@ -50,6 +50,9 @@ export function pageRoutes(ctx) {
     const nonce = crypto.randomBytes(16).toString('base64');
     res.set('Content-Security-Policy', pageCsp(nonce));
 
+    // JSON.stringify escapes quotes but not < > &, so "</script>" in the value would
+    // still close the inline script. Escape those to \uXXXX for a safe script context.
+    const jsToken = JSON.stringify(token).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
     const body = `<h1>Choose a new password</h1>
 <p>Enter a new password for your ${escape(config.appName)} account.</p>
 <form id="f"><label for="pw">New password</label>
@@ -58,7 +61,7 @@ export function pageRoutes(ctx) {
 <div id="done" style="display:none"><h1 class="ok">Password updated</h1>
 <p>Your password has been changed. You can now sign in to ${escape(config.appName)}.</p></div>
 <script nonce="${nonce}">
-const token=${JSON.stringify(token)};
+const token=${jsToken};
 const f=document.getElementById('f'),err=document.getElementById('err'),b=document.getElementById('b');
 f.addEventListener('submit',async(e)=>{e.preventDefault();err.textContent='';b.disabled=true;
   try{const r=await fetch('/v1/auth/password/reset',{method:'POST',headers:{'content-type':'application/json'},
